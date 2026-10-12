@@ -4,6 +4,11 @@ EngineAccounts non importa sorgenti, dati o unit dei consumer. Registrare client
 pubblici tramite OIDC_CLIENTS_JSON nel `.env`, client confidenziali tramite CLI.
 OIDC_CLIENTS_JSON=[] avvia il provider senza alcuna applicazione collegata.
 
+Estensioni additive 1.1.0: [richieste per i consumer](consumer-admin.md),
+ruolo per audience nell'access token, verifica authz server-side, SSO verso
+adminUrl e purge firmato verso adminApiUrl. Nessun setting del consumer viene
+renderizzato da Accounts; nessuna modifica al codice consumer è inclusa.
+
 Per [StreamingEngine](https://git.oberdfr.top/oberdfr/StreamingEngine) dichiarare
 clientId coerente con OIDC_CLIENT_ID, redirect `/auth/callback` e logout `/` sull'origine
 PUBLIC_APP_URL del consumer, audience coerente con OIDC_AUDIENCE, scope openid/profile/

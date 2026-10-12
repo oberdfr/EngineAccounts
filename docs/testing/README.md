@@ -32,3 +32,20 @@ file protetto fuori repo; non pubblicare log con code, secret, cookie o link ver
 Per integrazione con StreamingEngine provare token reale tramite JWKS e evento
 firmato da questo emitter contro proxy isolato. Health, HTTP, browser e video sono
 prove diverse; skip/dipendenze mancanti non vanno dichiarati passati.
+
+## Estensione admin 1.1.0
+
+Esiti e limitazioni: [verifica del revamp](admin-revamp-results.md).
+Seconda revisione visuale/sessioni/MFA: [risultati UI account](account-ui-redesign-results.md).
+
+Suite `administration`, `service-admin-event`, `service-authz-oidc`, `admin-ui`,
+`policy-oidc` e `ui-design`: ruoli, isolamento audience, ultimo globale, ban,
+ri-verifica session-bound, CSRF/rate limit, policy effettive, interstitial OIDC
+con MFA, firma purge separata, outbox/retry e contrasto dei token.
+La harness rifiuta schemi diversi da `engine_accounts_test` **prima** di migrare.
+
+Fixture `tests/browser/ui-fixture.ts`: loopback 18081, HTML sintetico senza DB,
+nessuna sessione produttiva. Runner `ui.browser.js`: 320/390/768/1440/1920px,
+JavaScript disabilitato, font locali, H1, focus, controlli e overflow; reflow
+equivalente 200%. Non sostituisce la verifica dello zoom nativo del browser,
+Safari/iOS, passkey hardware o integrazione consumer reale.

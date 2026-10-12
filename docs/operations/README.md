@@ -6,6 +6,32 @@
 file in StreamingEngine o nel parent. Le variabili di processo esplicite prevalgono.
 Tutti i default/vincoli sono in `src/config.ts`; inventario in [API](../api/README.md).
 
+Policy amministrabili: precedenza **env esplicito > override DB > default**.
+L'origine e il valore effettivo sono visibili in `/admin/settings`; un valore
+bloccato da env non cambia tramite UI. I segreti, issuer, DB, SMTP e materiale
+JWKS non sono modificabili da pannelli. `invite` chiude la registrazione libera:
+finché non è disponibile un flusso d'invito, gli operatori non devono prometterne
+la creazione tramite UI. I pannelli admin richiedono sempre TOTP/passkey.
+Il TTL effettivo si applica alle nuove sessioni e come limite durante la
+risoluzione delle sessioni esistenti. Una riduzione può quindi renderle non più
+valide anche prima della scadenza memorizzata; la UI mostra quel limite effettivo.
+L'outbox ritenta fino a 20 eventi ogni 30 secondi, senza seguire redirect.
+
+## Aggiornamento 1.1.0 (da eseguire dall'operatore, non da questo task)
+
+1. Backup protetto DB, `.env` e JWKS senza modificare segreti o issuer.
+2. Revisionare le nuove migrazioni additive e il contratto consumer §11–12.
+3. `npm ci`, `npm run typecheck`, test su `engine_accounts_test`,
+   `node scripts/check-config.mjs` (non stampa valori).
+4. `./scripts/rebuild.sh` compila e riavvia solo Accounts; l'avvio applica le
+   migrazioni nel DB_SCHEMA configurato. Non avviare un secondo processo su 8080.
+5. Bootstrap su sub esistente con `npm run cli -- user promote <sub> --global`;
+   l'utente attiva TOTP/passkey prima di aprire `/admin`.
+6. Configurare per servizio gli URL e gli scope come dati (env/CLI). Coordinare
+   separatamente il rilascio consumer: il purge non è operativo senza ricevitore.
+7. Verificare login, ri-verifica admin, ruoli, consegna outbox e invii SMTP;
+   readiness da sola non prova questi flussi. Nessun reset DB/container necessario.
+
 Per produzione impostare NODE_ENV=production, OIDC_ISSUER e PUBLIC_BASE_URL sullo
 stesso dominio HTTPS, DATABASE_URL, OIDC_EVENT_SIGNING_SECRET, ENGINE_ACCOUNTS_COOKIE_SECRET,
 SMTP raggiungibile e mittente autorizzato. TRUST_PROXY=true solo dietro ingress

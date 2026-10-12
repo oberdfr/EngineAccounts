@@ -1,13 +1,17 @@
 # Contratto — Engine Accounts (OIDC)
 
-> Baseline `1.0.0-frozen`. Implementata da Engine Accounts e consumata dal proxy.
+> Versione `1.1.0`, estensione additiva della baseline `1.0.0-frozen`.
 > Modifiche di protocollo richiedono versionamento e verifiche dei consumatori.
+> Compatibilità: PKCE, redirect, scope precedenti, firma JWT, refresh e
+> `account.deleted` restano invariati. Le nuove capacità richiedono opt-in del client.
 
 ## 1. Ruolo nell'architettura
 
 Engine Accounts è l'**identity provider della suite Engine**. Non sa nulla di StreamingEngine:
-nessuna UI, nessuna tabella, nessun endpoint per-servizio (D2). Conosce solo
-*account, sessioni, client, scope, consensi*.
+nessun dato applicativo o impostazione del consumer. Conosce
+*account, sessioni, client, scope, consensi, ruoli e registro servizi*.
+Un servizio corrisponde a un'audience e può avere più client. Le sue impostazioni
+si modificano esclusivamente nella pagina admin del servizio, non in Accounts.
 
 ```
 app della suite (relying party + resource server)
@@ -46,6 +50,7 @@ niente cookie cross-site per la sessione di login.
 | `profile` | `name` | nome visualizzato |
 | `email` | `email`, `email_verified` | email |
 | `offline_access` | — | abilita il refresh token |
+| `engine:admin` | `engine_roles` (solo access token) | ruolo amministrativo per l'audience corrente |
 
 ### Di servizio (registrati come dati, non come codice)
 
@@ -152,7 +157,7 @@ URL di consegna HTTPS; HTTP consentito sul loopback o su origini interne esatte
 autorizzate dall'operatore via BACKCHANNEL_HTTP_ALLOWED_ORIGINS. Nessun redirect
 seguito. Questa eccezione non rende sicuro HTTP su reti pubbliche/non fidate.
 
-## 9. CLI admin (nessuna UI per-servizio)
+## 9. CLI admin
 
 ```
 engine-accounts client add <client_id> --type public|confidential \
@@ -163,6 +168,11 @@ engine-accounts client add <client_id> --type public|confidential \
 
 engine-accounts user block <sub>          engine-accounts user unblock <sub>
 engine-accounts sessions revoke <sub>     engine-accounts keys rotate
+engine-accounts user list
+engine-accounts user promote <sub> --global
+engine-accounts user demote <sub> --global [--force]
+engine-accounts service-admin grant <sub> <service>
+engine-accounts service-admin revoke <sub> <service>
 ```
 
 Gli scope base, incluso openid, devono essere registrati esplicitamente: il provider
@@ -180,3 +190,83 @@ Middleware di validazione JWT con, in quest'ordine:
 4. Token valido e scope ok → `sub` disponibile per l'overlay `user` e per la cache con
    `Vary: Authorization` + `Cache-Control: private` (C1).
 5. **Isolamento per `sub`**: nessuna query dell'utente A può mai restituire dati di B.
+
+## 11. Ruoli per audience (1.1.0)
+
+`engine:admin` è uno scope base, da registrare esplicitamente e richiedere nel
+flusso OIDC. Soltanto un account attivo con tale scope concesso ottiene
+`engine_roles` nell'access token: `["admin"]` per un admin assegnato al servizio,
+`["admin","global"]` per un admin globale. Nessun ruolo di altre audience viene
+rivelato; un utente senza ruolo non riceve il claim. **Non compare nell'ID token**.
+Globali e assegnati devono attivare TOTP o passkey per accedere ai pannelli Accounts.
+Il bootstrap del primo globale è esclusivamente CLI. L'ultimo globale attivo non
+può essere declassato/bloccato/cancellato, salvo `--force` esplicito in CLI.
+La UI impedisce modifiche dei propri privilegi. I ruoli si verificano a ogni richiesta.
+
+Il TTL admin è invariato (`ACCESS_TOKEN_TTL`, default 900 secondi). Un JWT già
+emesso può restare valido offline fino a `exp`, anche dopo ban o revoca. Non usare
+il claim come unica autorizzazione per azioni critiche.
+
+### Verifica server-side
+
+`POST /services/authz`, JSON `{ "sub": "<UUID>", "serviceId": "<id registrato>" }`,
+autenticazione HTTP Basic con client **confidenziale** attivo del medesimo servizio
+e secret CLI (hash Argon2id nel DB). Non usa cookie/sessioni browser. La route
+server-to-server non richiede CSRF del browser; rifiuta richieste con Origin e ha
+rate limit. Non inviare il secret nel corpo, URL o log. Client pubblico, servizio
+diverso o disabilitato non possono verificare account di un'altra audience.
+
+Risposta autorizzata:
+```json
+{ "admin": true, "global": false, "status": "active" }
+```
+Stati: `active`, `blocked`, `deleted`. Account assente viene rappresentato come
+`deleted`; admin/global sono falsi per account non attivi. Risorse non autorizzate:
+404; autenticazione client invalida: 401; rate limit: 429. Il consumer deve fallire
+chiuso se Accounts non è disponibile e ripetere la verifica prima di ogni azione critica.
+
+### Pagina admin e SSO
+
+`adminUrl` è un link al servizio, non un redirect autenticato speciale. Il servizio
+avvia Authorization Code + PKCE S256, richiede `engine:admin` e usa la sessione
+Accounts per SSO. Per operazioni sensibili usare `max_age=300` (o più restrittivo),
+verificare `auth_time`, MFA secondo policy del consumer e l'endpoint authz.
+Accounts non rende né duplica i settings del servizio.
+
+## 12. API admin del servizio e purge (1.1.0)
+
+`adminApiUrl` è il destinatario **esatto** del POST server-to-server di purge.
+Accounts non espone `/internal`. Se manca l'URL, il purge non è disponibile.
+HTTPS fuori loopback; le sole eccezioni HTTP sono le origini esatte in
+`BACKCHANNEL_HTTP_ALLOWED_ORIGINS`. Credenziali URL, wildcard e fragment vietati;
+nessun redirect seguito; timeout 5 secondi. L'health del consumer è opzionale,
+non è implicito nel successo della consegna eventi.
+
+Payload canonico, sette campi in questo ordine, più signature:
+```json
+{
+  "event": "account.data_purge",
+  "sub": "<UUID stabile>",
+  "iss": "https://accounts.example",
+  "aud": "https://service.example/api",
+  "iat": 1759000000,
+  "exp": 1759000300,
+  "jti": "<UUID idempotency key>",
+  "signature": "<JWS compatto HS256>"
+}
+```
+Firma JWS HS256 `typ=JWT`, byte UTF-8 di `JSON.stringify({event,sub,iss,aud,iat,exp,jti})`.
+Chiave 32 byte HKDF-SHA256, radice UTF-8 `OIDC_EVENT_SIGNING_SECRET`, salt 32 byte
+zero (equivalente a salt vuoto HKDF), **info `engine-accounts/service-admin-api`**:
+non riusare la chiave di `account.deleted`. Origin dell'issuer è solo informativo.
+Verificare alg, firma, corrispondenza byte, issuer/audience, tipi, iat/exp (finestra
+massima 300 secondi, tolleranza futura 30 secondi), jti e idempotenza persistente.
+
+**204 = consegnato, 409 = già elaborato e consegnato**, tutti gli altri stati
+restano nell'outbox. Retry con lo stesso jti e nuova finestra iat/exp/firma breve.
+Il consumer conserva l'idempotency key anche oltre la scadenza del tentativo;
+deduplicare prima di ripetere il purge. Purge elimina solo i dati applicativi del
+sub in quel servizio, non l'identità Accounts né i ruoli negli altri servizi.
+Non confondere l'evento con cancellazione identità o revoca del consenso.
+
+Lato consumer fuori scope: [richieste esatte](../docs/integration/consumer-admin.md).

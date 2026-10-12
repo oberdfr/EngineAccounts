@@ -10,6 +10,20 @@ __Host-: il cookie resume usa Path=/auth/<uid>. TRUST_PROXY soltanto con ingress
 proteggere la porta diretta e configurare TLS/HSTS. CSP deriva origini dei client;
 logout conserva POST/xsrf del provider. Token/cookie/password non vanno nei log.
 
+Route admin: ruolo lato server su ogni richiesta, 404 senza autorizzazione,
+TOTP/passkey obbligatoria e ri-verifica password recente (5 minuti) legata alla
+sessione per azioni sensibili. POST con CSRF, rate limit e conferma esplicita.
+Nessuna modifica ai propri privilegi da UI. L'ultimo globale attivo è protetto;
+solo CLI `--force` può superare la protezione. Ban revoca sessioni e grant; il
+cambio password forzato impedisce completamento OIDC fino al cambio effettivo.
+
+`POST /services/authz` è server-to-server, non un form: HTTP Basic client
+confidenziale della stessa audience, nessun cookie browser/Origin e rate limit.
+Non richiede CSRF perché non usa autorità ambientale di cookie. I consumer
+verificano qui revoche e ban prima di azioni critiche, fallendo chiuso sugli errori.
+Purge `account.data_purge` usa una diversa derivazione HKDF e soltanto l'adminApiUrl
+registrata. I retry rinnovano la finestra temporale, non il jti idempotente.
+
 `.env`, JWKS private e backup sono segreti: permessi restrittivi, mai nel repository
 o nelle immagini. Persistenza chiavi obbligatoria tra deploy. Non cambiare derivazione
 dei segreti con dati cifrati esistenti. Nessun accesso ai dati applicativi dei consumer.

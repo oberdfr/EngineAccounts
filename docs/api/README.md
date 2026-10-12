@@ -20,7 +20,9 @@ Riferimenti: [contratto OIDC](../../contracts/oidc.md),
 - Claim in base a scope, audience/resource indicator, client secret hash Argon2id.
 - Evento account.deleted firmato verso backchannel_events_uri registrati.
 - CLI per registrare/disabilitare client, bloccare utenti, revocare sessioni,
-  ruotare chiavi; nessun endpoint pubblico di amministrazione per servizio.
+  ruotare chiavi, gestire ruoli globali e assegnati per audience.
+- Pannelli `/admin` globali e `/admin/services/:serviceId` limitati al servizio;
+  settings consumer esclusivamente nella loro pagina admin via SSO.
 
 `src/oidc/provider.ts` configura oidc-provider; adapter DB in src/oidc/adapter.ts.
 Dominio e persistenza parlano con AccountsStore/OidcTokenStore in src/db/repositories.ts.
@@ -83,12 +85,33 @@ sessioni, app, attività ed export/cancellazione. Non portare cookie Engine nell
 | /account/security | GET | Password/MFA/passkey/recovery |
 | /account/sessions | GET | Sessioni e revoche |
 | /account/apps | GET | Consensi/client autorizzati |
+| /account/services | GET | Servizi per audience, scope, ultima autorizzazione e ruolo |
+| /ui/force-password-change | GET/POST | Interstitial password obbligatoria prima dell'accesso |
+| /ui/mfa | GET/POST | Challenge TOTP del login standalone |
+| /ui/mfa/options | GET | Challenge WebAuthn associata al login standalone pending |
+| /ui/passkey | GET/POST | Login standalone con passkey discoverable |
+| /ui/passkey/options | GET | Challenge passkey one-use associata al browser |
+| /ui/interaction/:uid/force-password-change | GET/POST | Interstitial OIDC, nessun codice prima del cambio |
+| /admin | GET | Dashboard globali, MFA richiesta |
+| /admin/accounts | GET | Ricerca, filtri, paginazione account |
+| /admin/accounts/:sub | GET/POST | Dettaglio/azioni, conferma e ri-verifica recente |
+| /admin/services | GET | Registro per audience, client, origine e outbox |
+| /admin/services/:serviceId | GET/POST | Pannello limitato al servizio; 404 senza ruolo |
+| /admin/settings | GET/POST | Override infrastruttura ammessi, mai segreti |
+| /admin/audit | GET | Audit amministrativo con filtri |
+| /admin/reauth | GET/POST | Ri-verifica password, validità 5 minuti |
+| /admin/diagnostics | GET | DB, verifica SMTP, identificatori JWKS, outbox |
+| /admin/services/:serviceId/reauth | GET/POST | Ri-verifica di un amministratore assegnato |
+| /admin/services/:serviceId/accounts | GET | Lista utenti collegati soltanto al servizio |
+| /admin/services/:serviceId/accounts/:sub | GET/POST | Purge/revoca consenso limitati al servizio |
+| /services/authz | POST | JSON server-to-server, HTTP Basic confidenziale, stato/ruoli |
 | /account/activity | GET | Attività account |
 | /account/export | GET | Pagina export |
 | /account/export.json | GET | Export dati dell'utente autenticato |
 | /account/delete | GET/POST | Conferma/cancellazione con verifica credenziali |
 | /account/logout | POST | Logout pannello |
 | /account/profile/name | POST | Cambia nome |
+| /account/profile | GET | Modifica profilo |
 | /account/profile/email | POST | Avvia cambio email/verifica |
 | /account/security/password | POST | Cambio password |
 | /account/security/totp/setup | GET | Setup TOTP nella sessione |
@@ -118,6 +141,8 @@ root, ambiente esplicito ha precedenza. Non stampare config completa con segreti
 | Rete | HOST (default 0.0.0.0), PORT (8080), ENGINE_ACCOUNTS_PORT precede PORT; TRUST_PROXY false |
 | Identità | OIDC_ISSUER default localhost:8080, PUBLIC_BASE_URL default issuer, OIDC_AUDIENCE default https://api.engine.local/streaming |
 | Client pubblici | OIDC_CLIENTS_JSON, default []; registrazione dichiarativa di URI, audience, scope e backchannel prima dell'avvio OIDC |
+| Metadati servizio | In OIDC_CLIENTS_JSON: serviceId, serviceName, serviceDescription, adminUrl, adminApiUrl opzionali; stesso servizio per audience |
+| Policy istanza | EMAIL_VERIFICATION_REQUIRED false, TOTP_REQUIRED false, ADMIN_MFA_REQUIRED true, REGISTRATION_MODE open (open/closed/invite); override DB con precedenza env esplicito > DB > default |
 | Trasporto eventi | HTTPS fuori dal loopback; BACKCHANNEL_HTTP_ALLOWED_ORIGINS permette origini HTTP interne esatte autorizzate, redirect rifiutati |
 | DB | DATABASE_URL obbligatoria o composta da POSTGRES_*; DB_SCHEMA engine_accounts, DB_POOL_MAX 10, DB_SSL false |
 | Chiavi | OIDC_EVENT_SIGNING_SECRET e ENGINE_ACCOUNTS_COOKIE_SECRET obbligatori in produzione; ENGINE_ACCOUNTS_DATA_KEY o derivazione HKDF; ENGINE_ACCOUNTS_JWKS_PATH var/jwks.json |
@@ -159,6 +184,11 @@ e audience invece di aggiungere logica prodotto al core OIDC.
 | client list | elenco registrazioni |
 | client remove <id> | elimina la registrazione e i consensi collegati per cascata; non revoca istantaneamente JWT verificati offline |
 | user block <sub> / user unblock <sub> | blocca/riattiva account |
+| user list | elenco utenti e ruoli |
+| user promote <sub> --global | bootstrap/promozione globale esclusivamente via CLI per il primo admin |
+| user demote <sub> --global [--force] | declassamento, protezione ultimo globale salvo forza esplicita CLI |
+| service-admin grant/revoke <sub> <service> | assegnazione/revoca amministratore di servizio |
+| service add <service_id> --audience <url> | registro CLI, --service-name, --service-description, --admin-url, --admin-api-url |
 | sessions revoke <sub> | revoca sessioni utente |
 | keys rotate | nuova Ed25519 prima nel JWKS, conserva precedente; restart controllato necessario |
 
