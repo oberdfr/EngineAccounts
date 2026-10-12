@@ -33,18 +33,27 @@ describe('client pubblici dichiarati in .env', () => {
   });
   it('registra URI, scope, audience e backchannel senza domini nel codice', async () => {
     const calls = await capture();
-    expect(calls).toHaveLength(3);
-    expect(calls[2]!.values).toEqual([client.clientId, client.clientName, client.redirectUris,
+    expect(calls).toHaveLength(4);
+    expect(calls[3]!.values).toEqual([client.clientId, client.clientName, client.redirectUris,
       client.postLogoutRedirectUris, client.scope, client.audience, client.backchannelEventsUri]);
-    expect(calls[2]!.text).toContain('ON CONFLICT (client_id) DO UPDATE SET');
-    expect(calls[2]!.text).toContain("WHERE clients.client_type = 'public'");
-    expect(calls[2]!.text).not.toContain('streaming.oberdfr.top');
+    expect(calls[3]!.text).toContain('ON CONFLICT (client_id) DO UPDATE SET');
+    expect(calls[3]!.text).toContain("WHERE clients.client_type = 'public'");
+    expect(calls[3]!.text).not.toContain('streaming.oberdfr.top');
   });
   it('Accounts senza consumer non semina alcun client', async () => {
     expect(await capture('[]')).toEqual([]);
   });
+  it('merges metadata once for multiple clients of one service', async () => {
+    const calls = await capture(JSON.stringify([
+      { ...client, adminUrl: 'https://app.example.test/admin' },
+      { ...client, clientId: 'independent-tv', serviceName: 'Independent service' },
+    ]));
+    const updates = calls.filter((call) => call.text.includes('SET name = $2'));
+    expect(updates).toHaveLength(1);
+    expect(updates[0]?.values).toEqual([client.audience, 'Independent service', '', 'https://app.example.test/admin', null]);
+  });
   it('registra scope di servizio prima del provider', async () => {
-    expect((await capture())[1]!.values).toEqual(['app:read', client.audience]);
+    expect((await capture())[2]!.values).toEqual(['app:read', client.audience]);
   });
   it.each(['not-json', '{}', JSON.stringify([{ ...client, redirectUris: [] }]),
     JSON.stringify([{ ...client, redirectUris: ['https://*.example.test/callback'] }]),

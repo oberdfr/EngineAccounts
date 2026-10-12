@@ -37,9 +37,9 @@
     var status = document.getElementById('wa-status');
     if (!payload || !input) return;
 
-    var options;
+    var encodedOptions;
     try {
-      options = JSON.parse(payload.textContent || '{}');
+      encodedOptions = JSON.parse(payload.textContent || '{}');
     } catch (err) {
       if (status) status.textContent = 'Opzioni non valide.';
       return;
@@ -47,9 +47,13 @@
 
     var form = node.closest('form');
     if (!form) return;
+    var busy = false;
     form.addEventListener('submit', function (event) {
       event.preventDefault();
+      if (busy) return;
+      busy = true;
       if (status) status.textContent = 'Segui le istruzioni del tuo dispositivo…';
+      var options = JSON.parse(JSON.stringify(encodedOptions));
       options.challenge = base64urlToBuffer(options.challenge);
       options.user.id = base64urlToBuffer(options.user.id);
       if (options.excludeCredentials) {
@@ -57,8 +61,9 @@
           return Object.assign({}, c, { id: base64urlToBuffer(c.id) });
         });
       }
-      navigator.credentials
+      Promise.resolve().then(function () { return navigator.credentials
         .create({ publicKey: options })
+      })
         .then(function (credential) {
           input.value = JSON.stringify({
             id: credential.id,
@@ -67,12 +72,14 @@
             response: {
               clientDataJSON: bufferToBase64url(credential.response.clientDataJSON),
               attestationObject: bufferToBase64url(credential.response.attestationObject),
+              transports: credential.response.getTransports ? credential.response.getTransports() : [],
             },
-            transports: credential.response.getTransports ? credential.response.getTransports() : [],
+            clientExtensionResults: credential.getClientExtensionResults ? credential.getClientExtensionResults() : {},
           });
           form.submit();
         })
         .catch(function (err) {
+          busy = false;
           if (status) status.textContent = 'Operazione annullata o fallita: ' + err.name;
         });
     });
@@ -89,8 +96,14 @@
     var status = document.getElementById('wa-status');
     var input = document.querySelector('input[name="webauthnResponse"]');
     var form = document.getElementById('mfa-form');
-
-    jsonFetch(node.getAttribute('data-webauthn-options'), { credentials: 'same-origin' })
+    if (!input || !form) return;
+    var busy = false;
+    function authenticate(event) {
+      if (event) event.preventDefault();
+      if (busy) return;
+      busy = true;
+      if (status) status.textContent = 'Segui le istruzioni del tuo dispositivo…';
+      jsonFetch(node.getAttribute('data-webauthn-options'), { credentials: 'same-origin', cache: 'no-store' })
       .then(function (res) {
         if (!res.ok) throw new Error('options non disponibili');
         return res.json();
@@ -110,6 +123,7 @@
           id: assertion.id,
           rawId: bufferToBase64url(assertion.rawId),
           type: assertion.type,
+          clientExtensionResults: assertion.getClientExtensionResults ? assertion.getClientExtensionResults() : {},
           response: {
             clientDataJSON: bufferToBase64url(assertion.response.clientDataJSON),
             authenticatorData: bufferToBase64url(assertion.response.authenticatorData),
@@ -120,6 +134,7 @@
         form.submit();
       })
       .catch(function (err) {
+        busy = false;
         if (status) {
           status.textContent =
             err.name === 'NotAllowedError'
@@ -127,6 +142,9 @@
               : 'Operazione fallita: ' + err.message;
         }
       });
+    }
+    form.addEventListener('submit', authenticate);
+    authenticate();
   }
 
   function bufferToBase64url(buffer) {
@@ -140,11 +158,28 @@
   /* Il pulsante "Elimina account" chiede conferma senza JS inline. */
   function setupConfirmations() {
     var forms = document.querySelectorAll('form[data-confirm]');
-    for (var i = 0; i < forms.length; i++) {
-      forms[i].addEventListener('submit', function (event) {
-        if (!window.confirm(forms[i].getAttribute('data-confirm'))) event.preventDefault();
+    forms.forEach(function (form) {
+      if (!window.HTMLDialogElement || !HTMLDialogElement.prototype.showModal) return;
+      var approved = false;
+      form.addEventListener('submit', function (event) {
+        if (approved) return;
+        event.preventDefault();
+        var submitter = event.submitter;
+        var previous = document.activeElement;
+        var dialog = document.createElement('dialog');
+        dialog.setAttribute('aria-labelledby', 'confirmation-title');
+        var title = document.createElement('h2'); title.id = 'confirmation-title'; title.textContent = 'Conferma operazione';
+        var description = document.createElement('p'); description.textContent = form.getAttribute('data-confirm');
+        var cancel = document.createElement('button'); cancel.type = 'button'; cancel.textContent = 'Annulla';
+        var confirm = document.createElement('button'); confirm.type = 'button'; confirm.className = 'danger'; confirm.textContent = 'Conferma';
+        dialog.append(title, description, cancel, confirm); document.body.append(dialog);
+        var cleanup = function () { dialog.remove(); if (previous && previous.focus) previous.focus(); };
+        dialog.addEventListener('close', cleanup, { once: true });
+        cancel.addEventListener('click', function () { dialog.close(); });
+        confirm.addEventListener('click', function () { approved = true; dialog.close(); form.requestSubmit(submitter || undefined); });
+        dialog.showModal(); cancel.focus();
       });
-    }
+    });
   }
 
   function boot() {

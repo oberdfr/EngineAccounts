@@ -1,7 +1,7 @@
-import type { AdapterPayload } from 'oidc-provider';
+import { errors, type AdapterPayload } from 'oidc-provider';
 import type { Config } from '../config.js';
 import type { AccountsStore, OidcEntry, OidcTokenStore } from '../domain/ports.js';
-import type { ClientRecord } from '../domain/types.js';
+import type { ClientRecord, User } from '../domain/types.js';
 import { verifyPassword } from '../security/password.js';
 import type { ArgonConfig } from '../security/argon.js';
 
@@ -50,6 +50,8 @@ export class TokenAdapter {
   constructor(
     protected readonly name: string,
     protected readonly tokens: OidcTokenStore,
+    private readonly store?: AccountsStore,
+    private readonly eligible?: (user: User) => Promise<boolean>,
   ) {
     this.route = ROUTES[name] ?? { kind: 'tokens' };
   }
@@ -59,11 +61,31 @@ export class TokenAdapter {
   }
 
   async upsert(id: string, payload: AdapterPayload, expiresIn?: number): Promise<void> {
+    await this.checkAccount(payload);
     await this.tokens.upsert(this.kind(), id, payload as OidcEntry, expiresIn);
   }
 
   async find(id: string): Promise<OidcEntry | undefined> {
-    return this.tokens.find(this.kind(), id);
+    const payload = await this.tokens.find(this.kind(), id);
+    if (payload) await this.checkAccount(payload);
+    return payload;
+  }
+
+  private async checkAccount(payload: OidcEntry): Promise<void> {
+    if (!this.store || !['AuthorizationCode', 'RefreshToken', 'AccessToken'].includes(this.name)) return;
+    if (typeof payload.clientId === 'string') {
+      const client = await this.store.findClient(payload.clientId);
+      const services = await this.store.listServices();
+      if (!client?.enabled || services.some((service) => service.audience === client.audience && !service.enabled)) {
+        throw new errors.InvalidGrant('Client o servizio non disponibile');
+      }
+    }
+    if (typeof payload.accountId !== 'string') return;
+    const user = await this.store.findUserById(payload.accountId);
+    if (!user || user.status !== 'active' || user.mustChangePassword) {
+      throw new errors.InvalidGrant('Account non autorizzato: autenticazione richiesta');
+    }
+    if (this.eligible && !await this.eligible(user)) throw new errors.InvalidGrant('Account policy requires authentication');
   }
 
   async findByUid(uid: string): Promise<OidcEntry | undefined> {
@@ -115,6 +137,7 @@ export class ClientAdapter {
   async find(id: string): Promise<Record<string, unknown> | undefined> {
     const client = await this.store.findClient(id);
     if (!client || !client.enabled) return undefined;
+    if ((await this.store.listServices()).some((service) => service.audience === client.audience && !service.enabled)) return undefined;
     return toClientMetadata(client, this.config);
   }
 
@@ -232,11 +255,12 @@ export function createFullAdapter(deps: {
   tokens: OidcTokenStore;
   config: Config;
   argon: ArgonConfig;
+  eligible?: (user: User) => Promise<boolean>;
 }): (name: string) => TokenAdapter | ClientAdapter {
   return (name: string) =>
     name === 'Client'
       ? new ClientAdapter(deps.store, deps.config, deps.argon)
-      : new TokenAdapter(name, deps.tokens);
+      : new TokenAdapter(name, deps.tokens, deps.store, deps.eligible);
 }
 
 export { verifyPassword };

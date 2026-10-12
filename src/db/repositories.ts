@@ -32,6 +32,8 @@ interface UserRow {
   status: UserStatus;
   blocked_reason: string | null;
   totp_enabled: boolean;
+  is_global_admin: boolean;
+  must_change_password: boolean;
   created_at: Date;
   updated_at: Date;
   last_login_at: Date | null;
@@ -49,6 +51,8 @@ const toUser = (r: UserRow): User => ({
   status: r.status,
   blockedReason: r.blocked_reason,
   totpEnabled: r.totp_enabled,
+  isGlobalAdmin: r.is_global_admin,
+  mustChangePassword: r.must_change_password,
   createdAt: r.created_at,
   updatedAt: r.updated_at,
   lastLoginAt: r.last_login_at,
@@ -183,7 +187,7 @@ const toWebauthn = (r: WebauthnRow): WebauthnCredential => ({
 
 const USER_COLS = `id, email, password_hash, display_name, email_verified_at, status,
   blocked_reason, totp_enabled, created_at, updated_at, last_login_at, deleted_at,
-  failed_logins, locked_until`;
+  failed_logins, locked_until, is_global_admin, must_change_password`;
 const SESSION_COLS = `id, user_id, token_digest, provider_session_id, provider_session_uid, device_label,
   ip, user_agent, amr, created_at, last_seen_at, expires_at, revoked_at, revoke_reason`;
 const CLIENT_COLS = `client_id, client_name, client_type, client_secret_hash, redirect_uris,
@@ -246,6 +250,7 @@ export function createAccountsStore(db: Db): AccountsStore {
       // `status = 'deleted'`).
       const allowed: Record<string, string> = {
         passwordHash: 'password_hash',
+        mustChangePassword: 'must_change_password',
         displayName: 'display_name',
         email: 'email',
         emailVerifiedAt: 'email_verified_at',
@@ -338,12 +343,12 @@ export function createAccountsStore(db: Db): AccountsStore {
         [id, providerSessionId, providerSessionUid],
       );
     },
-    async listSessions(userId) {
+    async listSessions(userId, includeInactive = false) {
       const rows = await db.query<SessionRow>(
         `SELECT ${SESSION_COLS} FROM ${sessions()}
-         WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > now()
-         ORDER BY last_seen_at DESC`,
-        [userId],
+         WHERE user_id = $1 AND ($2::boolean OR (revoked_at IS NULL AND expires_at > now()))
+         ORDER BY last_seen_at DESC, id`,
+        [userId, includeInactive],
       );
       return rows.map(toSession);
     },

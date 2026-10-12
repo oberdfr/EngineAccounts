@@ -54,6 +54,11 @@ const publicClientSchema = z.object({
     .refine((scopes) => scopes.includes('openid'), 'scope deve includere openid'),
   audience: z.string().url(),
   backchannelEventsUri: clientUri.optional(),
+  serviceId: z.string().min(1).max(160).optional(),
+  serviceName: z.string().min(1).max(200).optional(),
+  serviceDescription: z.string().max(2000).optional(),
+  adminUrl: clientUri.optional(),
+  adminApiUrl: clientUri.optional(),
 }).strict();
 
 const configuredClientsSchema = z.string().default('[]').transform((value, ctx) => {
@@ -67,12 +72,25 @@ const configuredClientsSchema = z.string().default('[]').transform((value, ctx) 
   'clientId duplicato').refine((clients) => {
     const audiences = new Map<string, string>();
     for (const client of clients) for (const scope of client.scope) {
-      if (['openid', 'profile', 'email', 'offline_access'].includes(scope)) continue;
+       if (['openid', 'profile', 'email', 'offline_access', 'engine:admin'].includes(scope)) continue;
       if (audiences.has(scope) && audiences.get(scope) !== client.audience) return false;
       audiences.set(scope, client.audience);
     }
     return true;
-  }, 'Uno scope di servizio deve appartenere a una sola audience'));
+  }, 'Uno scope di servizio deve appartenere a una sola audience').refine((clients) => {
+    const serviceIds = new Map<string, string>();
+    for (const client of clients) if (client.serviceId) {
+      if (serviceIds.has(client.serviceId) && serviceIds.get(client.serviceId) !== client.audience) return false;
+      serviceIds.set(client.serviceId, client.audience);
+    }
+    for (const audience of new Set(clients.map((client) => client.audience))) {
+      const group = clients.filter((client) => client.audience === audience);
+      for (const key of ['serviceId', 'serviceName', 'serviceDescription', 'adminUrl', 'adminApiUrl'] as const) {
+        if (new Set(group.map((client) => client[key]).filter((value) => value !== undefined)).size > 1) return false;
+      }
+    }
+    return true;
+  }, 'Metadati servizio discordanti per la stessa audience'));
 
 const schema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -145,7 +163,11 @@ const schema = z.object({
   EMAIL_VERIFICATION_TTL: int(900, 60),
   EMAIL_CHANGE_TTL: int(900, 60),
   MAGIC_CODE_TTL: int(300, 60),
-  SESSION_TTL: int(1_209_600, 300),
+  SESSION_TTL: int(1_209_600, 300, 31_536_000),
+  EMAIL_VERIFICATION_REQUIRED: booleanish.default(false),
+  TOTP_REQUIRED: booleanish.default(false),
+  ADMIN_MFA_REQUIRED: booleanish.default(true).refine((value) => value, 'MFA admin obbligatoria'),
+  REGISTRATION_MODE: z.enum(['open', 'closed', 'invite']).default('open'),
   CONSENT_TTL: int(31_536_000, 3600),
 
   // --- argon2id --------------------------------------------------------------
@@ -195,6 +217,9 @@ export interface Config extends RawConfig {
   issuer: string;
   baseUrl: string;
   eventSigningKey: Buffer;
+  serviceAdminSigningKey: Buffer;
+  /** Names only: records explicit env precedence without retaining secret values. */
+  explicitEnvKeys: string[];
   dataKey: Buffer;
   cookieSecret: string;
   /** `Secure` sui cookie: con https e' sempre true. */
@@ -277,6 +302,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     if (client.backchannelEventsUri && !isAllowedBackchannelUri(client.backchannelEventsUri, raw.BACKCHANNEL_HTTP_ALLOWED_ORIGINS)) {
       throw new Error(`backchannelEventsUri non sicura per ${client.clientId}: HTTPS, loopback o origine HTTP interna autorizzata richiesti`);
     }
+    if (client.adminApiUrl && !isAllowedBackchannelUri(client.adminApiUrl, raw.BACKCHANNEL_HTTP_ALLOWED_ORIGINS)) {
+      throw new Error(`adminApiUrl non sicura per ${client.clientId}`);
+    }
+    if (client.adminUrl && !isAllowedBackchannelUri(client.adminUrl, raw.BACKCHANNEL_HTTP_ALLOWED_ORIGINS)) {
+      throw new Error(`adminUrl non sicura per ${client.clientId}`);
+    }
   }
   if (!raw.DATABASE_URL) {
     throw new Error(
@@ -316,6 +347,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     issuer,
     baseUrl,
     eventSigningKey,
+    serviceAdminSigningKey: hkdf(rootSecret, 'engine-accounts/service-admin-api'),
+    explicitEnvKeys: Object.keys(env).filter((key) => env[key] !== undefined),
     dataKey,
     cookieSecret,
     // `Secure` sui cookie: in produzione (issuer https) obbligatorio.

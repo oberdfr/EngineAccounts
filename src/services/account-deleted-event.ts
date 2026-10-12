@@ -5,6 +5,7 @@ import type { ClientRecord } from '../domain/types.js';
 import type { Db } from '../db/pool.js';
 import { createLogger } from '../logger.js';
 import { table } from '../db/pool.js';
+import { isAllowedBackchannelUri } from '../config.js';
 
 /**
  * C11 — evento di cancellazione account.
@@ -31,12 +32,13 @@ import { table } from '../db/pool.js';
  */
 
 export const ACCOUNT_DELETED = 'account.deleted';
+export const ACCOUNT_DATA_PURGE = 'account.data_purge';
 
 /** Ordine dei campi canonici: NON riordinare, e' il contratto. */
 export const CANONICAL_FIELDS = ['event', 'sub', 'iss', 'aud', 'iat', 'exp', 'jti'] as const;
 
 export interface AccountDeletedPayload {
-  event: typeof ACCOUNT_DELETED;
+  event: typeof ACCOUNT_DELETED | typeof ACCOUNT_DATA_PURGE;
   sub: string;
   iss: string;
   aud: string;
@@ -115,23 +117,34 @@ export async function makeAccountDeletedEvent(
   return assembleAccountDeletedEvent(payload, signature);
 }
 
+/** Same wire format, separate HKDF purpose and service-specific destination. */
+export async function makeAccountDataPurgeEvent(sub: string, audience: string, options: EventOptions): Promise<AccountDeletedEvent> {
+  const payload = { ...buildAccountDeletedPayload(sub, audience, options), event: ACCOUNT_DATA_PURGE } as AccountDeletedPayload;
+  return assembleAccountDeletedEvent(payload, await signAccountDeleted(payload, options.signingKey));
+}
+
 /** Verifica lato destinatario: stessa procedura, chiave condivisa. */
 export async function verifyAccountDeletedEvent(
   event: unknown,
   key: Uint8Array,
-  expected: { iss: string; aud?: string; now?: number },
+  expected: { iss: string; aud?: string; now?: number; event?: typeof ACCOUNT_DELETED | typeof ACCOUNT_DATA_PURGE },
 ): Promise<{ valid: true; payload: AccountDeletedPayload } | { valid: false; reason: string }> {
   if (typeof event !== 'object' || event === null) return { valid: false, reason: 'corpo non oggetto' };
   const candidate = event as Record<string, unknown>;
   for (const field of CANONICAL_FIELDS) {
     if (!(field in candidate)) return { valid: false, reason: `campo mancante: ${field}` };
   }
-  if (candidate.event !== ACCOUNT_DELETED) return { valid: false, reason: 'evento sconosciuto' };
+  if (candidate.event !== (expected.event ?? ACCOUNT_DELETED)) return { valid: false, reason: 'evento sconosciuto' };
   if (candidate.iss !== expected.iss) return { valid: false, reason: 'iss non valido' };
   if (expected.aud !== undefined && candidate.aud !== expected.aud) return { valid: false, reason: 'aud non valido' };
   if (typeof candidate.signature !== 'string') return { valid: false, reason: 'firma mancante' };
   const now = expected.now ?? Math.floor(Date.now() / 1000);
-  if (typeof candidate.exp === 'number' && candidate.exp < now) return { valid: false, reason: 'evento scaduto' };
+  if (typeof candidate.iat !== 'number' || typeof candidate.exp !== 'number' ||
+      !Number.isInteger(candidate.iat) || !Number.isInteger(candidate.exp) ||
+      candidate.iat > now + 30 || candidate.exp <= now || candidate.exp <= candidate.iat ||
+      candidate.exp - candidate.iat > 300) return { valid: false, reason: 'tempo non valido' };
+  if (typeof candidate.sub !== 'string' || typeof candidate.aud !== 'string' ||
+      typeof candidate.jti !== 'string' || !candidate.jti) return { valid: false, reason: 'claim non validi' };
 
   const payload: AccountDeletedPayload = {
     event: candidate.event as typeof ACCOUNT_DELETED,
@@ -164,6 +177,7 @@ const logger = createLogger((process.env.LOG_LEVEL as never) ?? 'info', { svc: '
 
 export interface EventEmitter {
   emitForClients(sub: string, clients: ClientRecord[]): Promise<{ jti: string; delivered: number; failed: number }>;
+  emitDataPurge(sub: string, service: { serviceId: string; audience: string; adminApiUrl: string | null }): Promise<{ jti: string; delivered: number; failed: number }>;
   flushPending(limit?: number): Promise<{ delivered: number; failed: number }>;
 }
 
@@ -171,6 +185,18 @@ export function createAccountDeletedEmitter(db: Db, config: Config): EventEmitte
   const outbox = table(db, 'outbox_events');
 
   return {
+    async emitDataPurge(sub, service) {
+      if (!service.adminApiUrl || !isAllowedBackchannelUri(service.adminApiUrl, config.BACKCHANNEL_HTTP_ALLOWED_ORIGINS)) {
+        throw new Error('API admin del servizio non disponibile');
+      }
+      const event = await makeAccountDataPurgeEvent(sub, service.audience, {
+        issuer: config.issuer, signingKey: config.serviceAdminSigningKey, ttlSeconds: 300,
+      });
+      await db.query(`INSERT INTO ${outbox} (id,event,sub,audience,jti,payload) VALUES ($1,$2,$3,$4,$5,$6)`,
+        [crypto.randomUUID(), event.event, sub, service.audience, event.jti, JSON.stringify(event)]);
+      const ok = await deliver(db, config, service.adminApiUrl, event);
+      return { jti: event.jti, delivered: ok ? 1 : 0, failed: ok ? 0 : 1 };
+    },
     async emitForClients(sub, clients) {
       let delivered = 0;
       let failed = 0;
@@ -205,6 +231,23 @@ export function createAccountDeletedEmitter(db: Db, config: Config): EventEmitte
       let delivered = 0;
       let failed = 0;
       for (const row of rows) {
+        if (row.payload.event === ACCOUNT_DATA_PURGE) {
+          const service = await db.one<{ admin_api_url: string | null; enabled: boolean }>(
+            `SELECT admin_api_url, enabled FROM ${table(db, 'services')} WHERE audience = $1`, [row.audience]);
+          if (!service?.enabled || !service.admin_api_url || !isAllowedBackchannelUri(service.admin_api_url, config.BACKCHANNEL_HTTP_ALLOWED_ORIGINS)) {
+            await db.query(`UPDATE ${outbox} SET attempts = attempts + 1, last_error = 'API admin non disponibile' WHERE jti = $1`, [row.jti]);
+            failed += 1;
+            continue;
+          }
+          // Retry retains its idempotency key but renews the short delivery window.
+          const renewed = await makeAccountDataPurgeEvent(String(row.payload.sub), row.audience, {
+            issuer: config.issuer, signingKey: config.serviceAdminSigningKey, jti: () => row.jti,
+          });
+          await db.query(`UPDATE ${outbox} SET payload = $2 WHERE jti = $1`, [row.jti, JSON.stringify(renewed)]);
+          if (await deliver(db, config, service.admin_api_url, renewed)) delivered += 1;
+          else failed += 1;
+          continue;
+        }
         const client = await findClientByAudience(db, row.audience);
         if (!client?.backchannelEventsUri) {
           await db.query(`UPDATE ${outbox} SET attempts = attempts + 1, last_error = 'nessun destinatario' WHERE jti = $1`, [
@@ -278,6 +321,7 @@ async function deliver(db: Db, config: Config, url: string, event: AccountDelete
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 5_000);
   try {
+    if (!isAllowedBackchannelUri(url, config.BACKCHANNEL_HTTP_ALLOWED_ORIGINS)) throw new Error('destinatario non sicuro');
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json', origin: config.issuer },
@@ -285,22 +329,22 @@ async function deliver(db: Db, config: Config, url: string, event: AccountDelete
       redirect: 'error',
       signal: controller.signal,
     });
-    if ((res.status >= 200 && res.status < 300) || res.status === 409) {
-      await db.query(`UPDATE ${outbox} SET delivered_at = now(), attempts = attempts + 1 WHERE jti = $1`, [event.jti]);
+    if ((event.event === ACCOUNT_DATA_PURGE ? res.status === 204 : (res.status >= 200 && res.status < 300)) || res.status === 409) {
+      await db.query(`UPDATE ${outbox} SET delivered_at = now(), attempts = attempts + 1, last_error = NULL WHERE jti = $1`, [event.jti]);
       return true;
     }
     await db.query(`UPDATE ${outbox} SET attempts = attempts + 1, last_error = $2 WHERE jti = $1`, [
       event.jti,
       `http ${res.status}`,
     ]);
-    logger.warn('evento account.deleted non accettato', { jti: event.jti, status: res.status });
+    logger.warn('evento non accettato', { event: event.event, jti: event.jti, status: res.status });
     return false;
   } catch (err) {
     await db.query(`UPDATE ${outbox} SET attempts = attempts + 1, last_error = $2 WHERE jti = $1`, [
       event.jti,
-      (err as Error).message.slice(0, 200),
+      'consegna fallita',
     ]);
-    logger.warn('consegna evento account.deleted fallita', { jti: event.jti, err: (err as Error).message });
+    logger.warn('consegna evento fallita', { jti: event.jti, event: event.event });
     return false;
   } finally {
     clearTimeout(timer);

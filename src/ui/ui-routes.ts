@@ -20,7 +20,9 @@ import {
 } from '../services/mfa.js';
 import { providerSessionCookieName, sessionCookieName, type SessionManager } from '../services/session-manager.js';
 import * as pages from '../ui/pages.js';
-import { esc, layout } from '../ui/layout.js';
+import { esc, layout, field } from '../ui/layout.js';
+import crypto from 'node:crypto';
+import { rateLimiterFromEnv } from '../security/rate-limit.js';
 
 /**
  * UI di interazione (`/ui/*`): login, registrazione, verifica, reset, codice
@@ -44,6 +46,7 @@ const SCOPE_DESCRIPTIONS: Record<string, string> = {
   profile: 'Nome visualizzato',
   email: 'Il tuo indirizzo email',
   offline_access: 'Accesso continuo senza reinserire la password',
+  'engine:admin': 'Verifica il ruolo amministrativo per questo servizio',
 };
 
 /** `resource` puo' arrivare una o piu' volte: la libreria lo tiene come lista. */
@@ -94,6 +97,203 @@ export async function registerUiRoutes(app: FastifyInstance, deps: UiDeps): Prom
   const csrfCookie = csrfCookieName(config.cookiePrefix);
   const sessionCookie = sessionCookieName(config);
   const providerCookie = providerSessionCookieName(config);
+  const pendingCookie = `${config.cookiePrefix}ea_pending`;
+  const passkeyCookie = `${config.cookiePrefix}ea_passkey`;
+  const flowLimiter = rateLimiterFromEnv(config);
+  type PendingLogin = { accountId: string; amr: Amr[] };
+
+  function savePending(key: string, pending: PendingLogin): void {
+    challenges.set(key, { kind: 'totp', value: JSON.stringify(pending), createdAt: Date.now() });
+  }
+  function readPending(key: string): PendingLogin | undefined {
+    const item = challenges.get(key);
+    if (!item) return undefined;
+    if (Date.now() - item.createdAt > 300_000) { challenges.delete(key); return undefined; }
+    try { return JSON.parse(item.value) as PendingLogin; } catch { return undefined; }
+  }
+  function standaloneKey(request: FastifyRequest): string | undefined {
+    const cookie = request.cookies?.[pendingCookie];
+    return cookie && /^[a-zA-Z0-9_-]{43}$/.test(cookie) ? `account-login:${cookie}` : undefined;
+  }
+  function beginStandalone(reply: FastifyReply, pending: PendingLogin): void {
+    const opaque = crypto.randomBytes(32).toString('base64url');
+    savePending(`account-login:${opaque}`, pending);
+    reply.setCookie(pendingCookie, opaque, { ...sessions.cookieOptions(), maxAge: 300 });
+  }
+  function forcePage(request: FastifyRequest, reply: FastifyReply, action: string, message?: string) {
+    return reply.header('Cache-Control', 'no-store').type('text/html; charset=utf-8').send(layout({
+      title: 'Aggiorna la password', body: `<h1>Aggiorna la password</h1><p>Prima di continuare devi scegliere una nuova password.</p>
+      ${message ? `<p role="alert">${esc(message)}</p>` : ''}
+      <form class="stack" method="post" action="${esc(action)}"><input type="hidden" name="${CSRF_FIELD}" value="${esc(ensureCsrf(request, reply))}">
+      ${field({ name: 'currentPassword', label: 'Password attuale', type: 'password', autocomplete: 'current-password', required: true })}
+      ${field({ name: 'newPassword', label: 'Nuova password', type: 'password', autocomplete: 'new-password', required: true, error: message })}
+      ${field({ name: 'confirm', label: 'Conferma nuova password', type: 'password', autocomplete: 'new-password', required: true })}
+      <button class="primary" type="submit">Aggiorna e continua</button></form>`,
+    }));
+  }
+  async function completeStandalone(request: FastifyRequest, reply: FastifyReply, pending: PendingLogin): Promise<FastifyReply> {
+    const user = await store.findUserById(pending.accountId);
+    if (!user || user.status !== 'active') return reply.redirect('/ui/login', 303);
+    const settings = await accounts.effectivePolicy();
+    if (settings.EMAIL_VERIFICATION_REQUIRED && !user.emailVerifiedAt) return reply.code(403).send({ error: 'email_verification_required' });
+    if (user.mustChangePassword) {
+      beginStandalone(reply, pending);
+      return reply.redirect('/ui/force-password-change', 303);
+    }
+    if (user.totpEnabled && !pending.amr.some((m) => ['otp', 'webauthn', 'recovery_code'].includes(m))) {
+      beginStandalone(reply, pending);
+      return reply.redirect('/ui/mfa', 303);
+    }
+    // Repeating standalone login in an authenticated browser need not leave
+    // another orphaned credential. Never apply this to finishLogin/OIDC linkage.
+    const reusable = await sessions.reusableStandalone(request.cookies?.[sessionCookie], user.id, pending.amr);
+    const created = reusable ? undefined : await sessions.create({ userId: user.id, amr: pending.amr, ...ctx(request) });
+    await accounts.onLoginSucceeded(user, pending.amr, ctx(request));
+    if (created) reply.setCookie(sessionCookie, created.cookieValue, { ...sessions.cookieOptions(), maxAge: Math.floor((created.record.expiresAt.getTime() - Date.now()) / 1000) });
+    const key = standaloneKey(request);
+    if (key) challenges.delete(key);
+    reply.clearCookie(pendingCookie, sessions.cookieOptions());
+    return reply.redirect(settings.TOTP_REQUIRED && !user.totpEnabled ? '/account/security/totp/setup' : '/account', 303);
+  }
+
+  async function standalonePending(request: FastifyRequest): Promise<PendingLogin | undefined> {
+    const key = standaloneKey(request);
+    const pending = key ? readPending(key) : undefined;
+    if (pending) return pending;
+    const active = await activeSession(request);
+    return active ? { accountId: active.user.id, amr: active.session.amr as Amr[] } : undefined;
+  }
+
+  for (const action of ['/ui/force-password-change', '/ui/interaction/:uid/force-password-change']) {
+    const interactionFlow = action.includes(':uid');
+    const getPending = async (request: FastifyRequest, reply: FastifyReply) => {
+      if (!interactionFlow) return standalonePending(request);
+      const { uid } = request.params as { uid: string };
+      const details = await safeDetails(request, reply, provider);
+      if (!details || details.uid !== uid) return undefined;
+      const saved = readPending(`force:${uid}`);
+      if (saved) return saved;
+      const active = await activeSession(request);
+      return active ? { accountId: active.user.id, amr: active.session.amr as Amr[] } : undefined;
+    };
+    app.get(action, async (request, reply) => {
+      const pending = await getPending(request, reply);
+      const user = pending ? await store.findUserById(pending.accountId) : undefined;
+      if (!user || user.status !== 'active') return reply.redirect('/ui/login', 303);
+      return forcePage(request, reply, interactionFlow ? `/ui/interaction/${(request.params as { uid: string }).uid}/force-password-change` : action);
+    });
+    app.post(action, async (request, reply) => {
+      if (!checkCsrf(request)) return csrfFailure(reply);
+      const rate = flowLimiter.checkIp(`force:${request.ip}`, 10, 60_000);
+      if (!rate.allowed) return reply.code(429).header('Retry-After', rate.retryAfterSeconds).send({ error: 'rate_limited' });
+      const pending = await getPending(request, reply);
+      if (!pending) return reply.redirect('/ui/login', 303);
+      const body = (request.body ?? {}) as Record<string, unknown>;
+      const uid = interactionFlow ? (request.params as { uid: string }).uid : '';
+      const target = interactionFlow ? `/ui/interaction/${uid}/force-password-change` : action;
+      if (typeof body.newPassword !== 'string' || body.newPassword !== body.confirm) {
+        reply.code(400); return forcePage(request, reply, target, 'Le due password non coincidono.');
+      }
+      const result = await accounts.changePassword(pending.accountId, String(body.currentPassword ?? ''), body.newPassword, ctx(request));
+      if (!result.ok) { reply.code(400); return forcePage(request, reply, target, result.message); }
+      if (!interactionFlow) return completeStandalone(request, reply, pending);
+      challenges.delete(`force:${uid}`);
+      const user = await store.findUserById(pending.accountId);
+      if (user?.totpEnabled && !pending.amr.some((m) => ['otp', 'webauthn', 'recovery_code'].includes(m))) {
+        challenges.set(`interaction:${uid}`, { kind: 'totp', value: user.id, createdAt: Date.now() });
+        return reply.redirect(`/ui/interaction/${uid}/mfa?method=totp`, 303);
+      }
+      return finishLogin(request, reply, pending.accountId, pending.amr);
+    });
+  }
+
+  app.get('/ui/mfa', async (request, reply) => {
+    const key = standaloneKey(request);
+    if (!key || !readPending(key)) return reply.redirect('/ui/login', 303);
+    const method = (request.query as { method?: string })?.method ?? 'totp';
+    const usePasskey = method === 'webauthn';
+    return reply.header('Cache-Control', 'no-store').type('text/html; charset=utf-8').send(layout({ title: 'Secondo fattore', flash: (request.query as { error?: string }).error ? { kind: 'error', text: 'Verifica non riuscita. Usa un codice valido o riprova con la passkey. Nessun accesso è stato completato.' } : undefined, body:
+      `<p class="eyebrow">VERIFICA IDENTITÀ</p><h1>Un ultimo passaggio.</h1><p class="lede">${usePasskey ? 'Conferma l’accesso con la tua passkey.' : method === 'recovery' ? 'Inserisci uno dei codici di recupero che hai conservato. Ogni codice è utilizzabile una sola volta.' : 'Inserisci il codice a sei cifre della tua app di autenticazione.'}</p><form id="mfa-form" class="stack" method="post" action="/ui/mfa"><input type="hidden" name="${CSRF_FIELD}" value="${esc(ensureCsrf(request, reply))}"><input type="hidden" name="method" value="${usePasskey ? 'webauthn' : method === 'recovery' ? 'recovery' : 'totp'}">${usePasskey ? '<div data-webauthn="auth" data-webauthn-options="/ui/mfa/options"><p id="wa-status" role="status">Premi Continua e segui le istruzioni del dispositivo.</p></div><input type="hidden" name="webauthnResponse"><noscript><p class="warning">Le passkey richiedono JavaScript. Puoi usare TOTP o un codice di recupero.</p></noscript>' : field({ name: 'code', label: method === 'recovery' ? 'Codice di recupero' : 'Codice a sei cifre', autocomplete: 'one-time-code', inputmode: method === 'recovery' ? 'text' : 'numeric', required: true })}<button class="primary" type="submit">Continua</button></form><nav class="links"><a href="/ui/mfa?method=totp">Usa TOTP</a><a href="/ui/mfa?method=recovery">Usa un codice di recupero</a><a href="/ui/mfa?method=webauthn">Usa una passkey</a></nav>` }));
+  });
+  app.get('/ui/mfa/options', async (request, reply) => {
+    const key = standaloneKey(request);
+    const pending = key ? readPending(key) : undefined;
+    if (!pending) return reply.code(401).send({ error: 'login_required' });
+    const credentials = await store.listWebauthnCredentials(pending.accountId);
+    if (!credentials.length) return reply.code(400).send({ error: 'no_passkeys' });
+    const options = await webauthnAuthenticationOptions(config, credentials);
+    challenges.set(`webauthn:${key}`, { kind: 'webauthn', value: options.challenge, createdAt: Date.now() });
+    return reply.header('Cache-Control', 'no-store').send(options);
+  });
+  app.post('/ui/mfa', async (request, reply) => {
+    if (!checkCsrf(request)) return csrfFailure(reply);
+    const key = standaloneKey(request);
+    const pending = key ? readPending(key) : undefined;
+    if (!pending) return reply.redirect('/ui/login', 303);
+    const rate = flowLimiter.checkIp(`mfa:${request.ip}`, 10, 60_000);
+    if (!rate.allowed) return reply.code(429).header('Retry-After', rate.retryAfterSeconds).send({ error: 'rate_limited' });
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const method = String(body.method ?? 'totp');
+    let verified = false;
+    let amr: Amr = 'otp';
+    if (method === 'totp') verified = await verifyTotpForUser(store, config, pending.accountId, String(body.code ?? ''));
+    if (method === 'recovery') { verified = await consumeRecoveryCode(store, recoveryKey, pending.accountId, String(body.code ?? '')); amr = 'recovery_code'; }
+    if (method === 'webauthn') {
+      verified = await verifyAssertion(body.webauthnResponse, `webauthn:${key}`, pending.accountId);
+      amr = 'webauthn';
+    }
+    if (!verified) return reply.redirect(`/ui/mfa?error=verification&method=${method === 'webauthn' ? 'webauthn' : method === 'recovery' ? 'recovery' : 'totp'}`, 303);
+    challenges.delete(key!);
+    challenges.delete(`webauthn:${key}`);
+    return completeStandalone(request, reply, { ...pending, amr: [...pending.amr, amr] });
+  });
+
+  /** Discoverable passkey login; the opaque cookie binds the one-use challenge to this browser. */
+  app.get('/ui/passkey', async (request, reply) => reply.header('Cache-Control', 'no-store').type('text/html; charset=utf-8').send(layout({
+    title: 'Accedi con una passkey', body: `<h1>Accedi con una passkey</h1><form id="mfa-form" class="stack" method="post" action="/ui/passkey"><input type="hidden" name="${CSRF_FIELD}" value="${esc(ensureCsrf(request, reply))}"><div data-webauthn="auth" data-webauthn-options="/ui/passkey/options"><p id="wa-status" role="status">Segui le istruzioni del dispositivo.</p></div><input type="hidden" name="webauthnResponse"><button type="submit">Accedi con una passkey</button></form><p><a href="/ui/login">Usa la password</a></p>`,
+  })));
+  app.get('/ui/passkey/options', async (request, reply) => {
+    const rate = flowLimiter.checkIp(`passkey:${request.ip}`, 20, 60_000);
+    if (!rate.allowed) return reply.code(429).header('Retry-After', rate.retryAfterSeconds).send({ error: 'rate_limited' });
+    const previous = request.cookies?.[passkeyCookie];
+    if (previous) challenges.delete(`passkey-login:${previous}`);
+    const opaque = crypto.randomBytes(32).toString('base64url');
+    const options = await webauthnAuthenticationOptions(config, []);
+    challenges.set(`passkey-login:${opaque}`, { kind: 'webauthn', value: options.challenge, createdAt: Date.now() });
+    reply.setCookie(passkeyCookie, opaque, { ...sessions.cookieOptions(), maxAge: 300 });
+    return reply.header('Cache-Control', 'no-store').send(options);
+  });
+  app.post('/ui/passkey', async (request, reply) => {
+    if (!checkCsrf(request)) return csrfFailure(reply);
+    const rate = flowLimiter.checkIp(`passkey-verify:${request.ip}`, 20, 60_000);
+    if (!rate.allowed) return reply.code(429).header('Retry-After', rate.retryAfterSeconds).send({ error: 'rate_limited' });
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const opaque = request.cookies?.[passkeyCookie];
+    const parsed = parseAssertion(body.webauthnResponse);
+    const credential = parsed && typeof parsed.id === 'string' ? await store.findWebauthnCredential(parsed.id) : undefined;
+    reply.clearCookie(passkeyCookie, sessions.cookieOptions());
+    if (!opaque || !/^[A-Za-z0-9_-]{43}$/.test(opaque) || !credential
+      || !await verifyAssertion(body.webauthnResponse, `passkey-login:${opaque}`, credential.userId, true)) {
+      if (opaque) challenges.delete(`passkey-login:${opaque}`);
+      return reply.code(401).type('text/html; charset=utf-8').send(layout({ title: 'Accesso passkey non riuscito', flash: { kind: 'error', text: 'Non è stato possibile verificare la passkey. La richiesta potrebbe essere scaduta o non valida. Nessun accesso è stato completato.' }, body: '<h1>Riprova l’accesso.</h1><p>Avvia una nuova richiesta e scegli una passkey registrata su Engine Accounts.</p><div class="row"><a class="button primary" href="/ui/passkey">Riprova con passkey</a><a class="button secondary" href="/ui/login">Usa la password</a></div>' }));
+    }
+    return completeStandalone(request, reply, { accountId: credential.userId, amr: ['webauthn'] });
+  });
+
+  function parseAssertion(raw: unknown): { id?: unknown; response?: { userHandle?: unknown } } | undefined {
+    try { const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw; return parsed && typeof parsed === 'object' ? parsed : undefined; } catch { return undefined; }
+  }
+  async function verifyAssertion(raw: unknown, key: string, userId: string, requireHandle = false): Promise<boolean> {
+    const challenge = challenges.take(key);
+    const parsed = parseAssertion(raw);
+    if (!challenge || challenge.kind !== 'webauthn' || Date.now() - challenge.createdAt > 300_000 || !parsed
+      || typeof parsed.id !== 'string' || (requireHandle && !parsed.response?.userHandle)) return false;
+    const credential = await store.findWebauthnCredential(parsed.id);
+    if (!credential || credential.userId !== userId) return false;
+    const result = await verifyWebauthnAuthentication(config, parsed, challenge.value, { id: userId }, credential);
+    if (result.verified) await store.updateWebauthnCounter(credential.id, result.newCounter ?? credential.counter);
+    return result.verified;
+  }
 
   /**
    * Header di `Set-Cookie` accumulati: `provider.interactionFinished()` scrive
@@ -324,18 +524,7 @@ export async function registerUiRoutes(app: FastifyInstance, deps: UiDeps): Prom
     await holdFor(config.HTTP_LOGIN_SLOW_MS, () => undefined);
 
     if (outcome.status === 'ok' && outcome.user) {
-      const { record, cookieValue } = await sessions.create({
-        userId: outcome.user.id,
-        amr: ['pwd'],
-        ip: request.ip ?? null,
-        userAgent: (request.headers['user-agent'] as string | undefined) ?? null,
-      });
-      await accounts.onLoginSucceeded(outcome.user, ['pwd'], ctx(request));
-      reply.setCookie(sessionCookie, cookieValue, {
-        ...sessions.cookieOptions(),
-        maxAge: Math.max(0, Math.floor((record.expiresAt.getTime() - Date.now()) / 1000)),
-      });
-      return reply.redirect('/account', 303);
+      return completeStandalone(request, reply, { accountId: outcome.user.id, amr: ['pwd'] });
     }
 
     const message =
@@ -385,6 +574,9 @@ export async function registerUiRoutes(app: FastifyInstance, deps: UiDeps): Prom
     const errors: string[] = [];
     if (password !== String(body.confirm ?? '')) errors.push('Le due password non coincidono.');
 
+    if (errors.length) return reply.code(400).type('text/html; charset=utf-8').send(
+      pages.resetPasswordPage({ csrf: ensureCsrf(request, reply), token: String(body.token ?? ''), errors }),
+    );
     const result = await accounts.resetPassword(String(body.token ?? ''), password, ctx(request));
     if (!result.ok) {
       errors.push(result.message);
@@ -422,18 +614,7 @@ export async function registerUiRoutes(app: FastifyInstance, deps: UiDeps): Prom
         }),
       );
     }
-    const { record, cookieValue } = await sessions.create({
-      userId: outcome.user.id,
-      amr: ['magic_code'],
-      ip: request.ip ?? null,
-      userAgent: (request.headers['user-agent'] as string | undefined) ?? null,
-    });
-    await accounts.onLoginSucceeded(outcome.user, ['magic_code'], ctx(request));
-    reply.setCookie(sessionCookie, cookieValue, {
-      ...sessions.cookieOptions(),
-      maxAge: Math.max(0, Math.floor((record.expiresAt.getTime() - Date.now()) / 1000)),
-    });
-    return reply.redirect('/account', 303);
+    return completeStandalone(request, reply, { accountId: outcome.user.id, amr: ['magic_code'] });
   });
 
   /**
@@ -451,6 +632,24 @@ export async function registerUiRoutes(app: FastifyInstance, deps: UiDeps): Prom
     accountId: string,
     amr: Amr[],
   ): Promise<FastifyReply> {
+    const current = await store.findUserById(accountId);
+    if (!current || current.status !== 'active') return reply.redirect('/ui/login', 303);
+    if (current.mustChangePassword) {
+      const { uid } = request.params as { uid: string };
+      if (!await safeDetails(request, reply, provider)) return reply.redirect('/ui/login', 303);
+      savePending(`force:${uid}`, { accountId, amr });
+      return reply.redirect(`/ui/interaction/${uid}/force-password-change`, 303);
+    }
+    const settings = await accounts.effectivePolicy();
+    if ((settings.EMAIL_VERIFICATION_REQUIRED && !current.emailVerifiedAt) || (settings.TOTP_REQUIRED && !current.totpEnabled)) {
+      return reply.code(403).type('text/html; charset=utf-8').send(layout({ title: 'Account da completare', body:
+        '<h1>Completa la sicurezza dell’account</h1><p>Verifica la tua email e attiva TOTP prima di autorizzare questa applicazione.</p><p><a href="/ui/login">Accedi al pannello account</a></p>' }));
+    }
+    if (current.totpEnabled && !amr.some((m) => ['otp', 'webauthn', 'recovery_code'].includes(m))) {
+      const { uid } = request.params as { uid: string };
+      challenges.set(`interaction:${uid}`, { kind: 'totp', value: current.id, createdAt: Date.now() });
+      return reply.redirect(`/ui/interaction/${uid}/mfa?method=totp`, 303);
+    }
     const { record, cookieValue } = await sessions.create({
       userId: accountId,
       amr,
@@ -483,6 +682,7 @@ export async function registerUiRoutes(app: FastifyInstance, deps: UiDeps): Prom
     let interaction;
     try {
       interaction = await provider.interactionDetails(request.raw, reply.raw);
+      if (interaction.uid !== uid) return reply.redirect('/ui/login?error=interaction_expired', 303);
     } catch (err) {
       if (err instanceof errors.SessionNotFound) {
         return reply.redirect('/ui/login?error=interaction_expired', 303);
@@ -492,6 +692,11 @@ export async function registerUiRoutes(app: FastifyInstance, deps: UiDeps): Prom
 
     const params = sanitizedParams(interaction.params);
     const csrf = ensureCsrf(request, reply);
+    const existing = await activeSession(request);
+    if (existing?.user.mustChangePassword) {
+      savePending(`force:${uid}`, { accountId: existing.user.id, amr: existing.session.amr as Amr[] });
+      return reply.redirect(`/ui/interaction/${uid}/force-password-change`, 303);
+    }
     if (interaction.prompt.name === 'consent') {
       const scopes = params.scope ? params.scope.split(' ').filter(Boolean) : [];
       const catalog = scopeCatalog();
@@ -524,6 +729,7 @@ export async function registerUiRoutes(app: FastifyInstance, deps: UiDeps): Prom
 
   app.post('/ui/interaction/:uid/login', async (request, reply) => {
     if (!checkCsrf(request)) return csrfFailure(reply);
+    if (!await safeDetails(request, reply, provider)) return reply.redirect('/ui/login?error=interaction_expired', 303);
     const { uid } = request.params as { uid: string };
     const body = (request.body ?? {}) as Record<string, unknown>;
     markStart();
@@ -550,6 +756,7 @@ export async function registerUiRoutes(app: FastifyInstance, deps: UiDeps): Prom
       );
     }
 
+    if (outcome.user.mustChangePassword) return finishLogin(request, reply, outcome.user.id, ['pwd']);
     if (outcome.user.totpEnabled) {
       // Secondo fattore obbligatorio: challenge tenuto in memoria, 5 minuti.
       challenges.set(`interaction:${uid}`, { kind: 'totp', value: outcome.user.id, createdAt: Date.now() });
@@ -560,6 +767,9 @@ export async function registerUiRoutes(app: FastifyInstance, deps: UiDeps): Prom
 
   app.get('/ui/interaction/:uid/mfa', async (request, reply) => {
     const { uid } = request.params as { uid: string };
+    if (!await safeDetails(request, reply, provider)) return reply.redirect('/ui/login?error=interaction_expired', 303);
+    const pending = challenges.get(`interaction:${uid}`);
+    if (!pending || Date.now() - pending.createdAt > 300_000) return reply.redirect('/ui/login?error=interaction_expired', 303);
     const method = ((request.query as { method?: string } | undefined)?.method ?? 'totp') as
       | 'totp'
       | 'webauthn'
@@ -578,25 +788,30 @@ export async function registerUiRoutes(app: FastifyInstance, deps: UiDeps): Prom
 
   app.get('/ui/interaction/:uid/mfa/options', async (request, reply) => {
     const { uid } = request.params as { uid: string };
+    if (!await safeDetails(request, reply, provider)) return reply.code(401).send({ error: 'interaction_expired' });
     const pending = challenges.get(`interaction:${uid}`);
-    if (!pending) return reply.code(400).send({ error: 'challenge scaduta' });
+    if (!pending || Date.now() - pending.createdAt > 300_000) return reply.code(400).send({ error: 'challenge scaduta' });
     const credentials = await store.listWebauthnCredentials(pending.value);
+    if (!credentials.length) return reply.code(400).send({ error: 'no_passkeys' });
     const options = await webauthnAuthenticationOptions(
       config,
       credentials.map((c) => ({ credentialId: c.credentialId, transports: c.transports })),
     );
-    // La challenge WebAuthn vive in un cookie firmato: nessuno script inline.
+    // In-memory challenge bound to the provider's validated interaction cookie.
     challenges.set(`webauthn:${uid}`, { kind: 'webauthn', value: options.challenge, createdAt: Date.now() });
     return reply.header('Cache-Control', 'no-store').send(options);
   });
 
   app.post('/ui/interaction/:uid/mfa', async (request, reply) => {
     if (!checkCsrf(request)) return csrfFailure(reply);
+    if (!await safeDetails(request, reply, provider)) return reply.redirect('/ui/login?error=interaction_expired', 303);
+    const rate = flowLimiter.checkIp(`mfa:${request.ip}`, 10, 60_000);
+    if (!rate.allowed) return reply.code(429).header('Retry-After', rate.retryAfterSeconds).send({ error: 'rate_limited' });
     const { uid } = request.params as { uid: string };
     const body = (request.body ?? {}) as Record<string, unknown>;
     const method = String(body.method ?? 'totp');
     const pending = challenges.take(`interaction:${uid}`);
-    if (!pending) return reply.redirect('/ui/login?error=interaction_expired', 303);
+    if (!pending || Date.now() - pending.createdAt > 300_000) return reply.redirect('/ui/login?error=interaction_expired', 303);
 
     let verified = false;
     let amr: Amr = 'otp';
@@ -608,31 +823,7 @@ export async function registerUiRoutes(app: FastifyInstance, deps: UiDeps): Prom
       verified = await consumeRecoveryCode(store, recoveryKey, pending.value, String(body.code ?? ''));
       amr = 'recovery_code';
     } else if (method === 'webauthn') {
-      const raw = String(body.webauthnResponse ?? '');
-      if (raw) {
-        const parsed = JSON.parse(raw) as { id?: string };
-        const credential = parsed.id ? await store.findWebauthnCredential(parsed.id) : undefined;
-        const challenge = challenges.take(`webauthn:${uid}`);
-        // Isolamento: la credenziale deve appartenere all'utente della challenge.
-        if (credential && challenge && credential.userId === pending.value) {
-          const result = await verifyWebauthnAuthentication(
-            config,
-            JSON.parse(raw),
-            challenge.value,
-            { id: pending.value },
-            {
-              credentialId: credential.credentialId,
-              publicKey: credential.publicKey,
-              counter: credential.counter,
-              transports: credential.transports,
-            },
-          );
-          verified = result.verified;
-          if (verified) {
-            await store.updateWebauthnCounter(credential.id, result.newCounter ?? credential.counter + 1);
-          }
-        }
-      }
+      verified = await verifyAssertion(body.webauthnResponse, `webauthn:${uid}`, pending.value);
       amr = 'webauthn';
     }
 
@@ -642,13 +833,14 @@ export async function registerUiRoutes(app: FastifyInstance, deps: UiDeps): Prom
         pages.interactionMfaPage({
           csrf: ensureCsrf(request, reply),
           uid,
-          method: method === 'webauthn' ? 'webauthn' : (method as 'totp' | 'recovery'),
+           method: method === 'webauthn' ? 'webauthn' : method === 'recovery' ? 'recovery' : 'totp',
           errors: ['Codice non valido. Riprova.'],
           webauthnOptionsUrl: `/ui/interaction/${uid}/mfa/options`,
         }),
       );
     }
 
+    challenges.delete(`webauthn:${uid}`);
     return finishLogin(request, reply, pending.value, ['pwd', amr]);
   });
 
@@ -658,6 +850,7 @@ export async function registerUiRoutes(app: FastifyInstance, deps: UiDeps): Prom
     const body = (request.body ?? {}) as Record<string, unknown>;
     const active = await activeSession(request);
     if (!active) return reply.redirect('/ui/login', 303);
+    if (active.user.mustChangePassword) return reply.redirect(`/ui/interaction/${uid}/force-password-change`, 303);
 
     const details = await safeDetails(request, reply, provider);
     if (!details) return reply.redirect('/ui/login?error=interaction_expired', 303);
@@ -684,7 +877,7 @@ export async function registerUiRoutes(app: FastifyInstance, deps: UiDeps): Prom
       userId: active.user.id,
       clientId,
       scope,
-      expiresAt: new Date(Date.now() + config.CONSENT_TTL * 1000),
+      expiresAt: new Date(Date.now() + (await accounts.effectivePolicy()).CONSENT_TTL * 1000),
     });
     await store.appendAudit({
       userId: active.user.id,
@@ -707,20 +900,24 @@ export async function registerUiRoutes(app: FastifyInstance, deps: UiDeps): Prom
   /* ------------------------------------------------------------------ */
 
   app.post('/ui/webauthn/register/options', async (request, reply) => {
+    if (!checkCsrf(request)) return csrfFailure(reply);
     const active = await activeSession(request);
     if (!active) return reply.code(401).send({ error: 'non autenticato' });
-    const options = await webauthnRegistrationOptions(config, active.user);
-    // La challenge non finisce in uno script inline: la pagina la chiede.
+    if (active.user.mustChangePassword) return reply.code(403).send({ error: 'password_change_required' });
+    const options = await webauthnRegistrationOptions(config, active.user, await store.listWebauthnCredentials(active.user.id));
+    challenges.set(`webauthn-register:${active.session.id}`, { kind: 'webauthn', value: options.challenge, createdAt: Date.now() });
     reply.header('Cache-Control', 'no-store');
     return reply.send(options);
   });
 
   app.post('/ui/webauthn/register/verify', async (request, reply) => {
+    if (!checkCsrf(request)) return csrfFailure(reply);
     const active = await activeSession(request);
     if (!active) return reply.code(401).send({ error: 'non autenticato' });
     const body = (request.body ?? {}) as Record<string, unknown>;
-    const challenge = challenges.take(`webauthn-register:${active.user.id}`);
-    if (!challenge) return reply.code(400).send({ error: 'challenge scaduta' });
+    if (active.user.mustChangePassword) return reply.code(403).send({ error: 'password_change_required' });
+    const challenge = challenges.take(`webauthn-register:${active.session.id}`);
+    if (!challenge || challenge.kind !== 'webauthn' || Date.now() - challenge.createdAt > 300_000) return reply.code(400).send({ error: 'challenge scaduta' });
     const result = await completeWebauthnRegistration(
       config,
       body.response ?? body,
@@ -753,15 +950,8 @@ export async function registerUiRoutes(app: FastifyInstance, deps: UiDeps): Prom
   });
 
   app.post('/ui/webauthn/register/challenge', async (request, reply) => {
-    const active = await activeSession(request);
-    if (!active) return reply.code(401).send({ error: 'non autenticato' });
-    const options = await webauthnRegistrationOptions(config, active.user);
-    challenges.set(`webauthn-register:${active.user.id}`, {
-      kind: 'webauthn',
-      value: options.challenge,
-      createdAt: Date.now(),
-    });
-    return reply.send({ ok: true });
+    // Old split endpoint generated a different challenge from /options and could never verify.
+    return reply.code(410).send({ error: 'use_register_options' });
   });
 
   /** Ricarica la cache degli scope di servizio (usata dal consenso). */
@@ -774,7 +964,9 @@ export async function registerUiRoutes(app: FastifyInstance, deps: UiDeps): Prom
 /** `interactionDetails` può fallire (cookie assente, interazione scaduta). */
 async function safeDetails(request: FastifyRequest, reply: FastifyReply, provider: Provider) {
   try {
-    return await provider.interactionDetails(request.raw, reply.raw);
+    const details = await provider.interactionDetails(request.raw, reply.raw);
+    const uid = (request.params as { uid?: string } | undefined)?.uid;
+    return uid && details.uid !== uid ? undefined : details;
   } catch {
     return undefined;
   }

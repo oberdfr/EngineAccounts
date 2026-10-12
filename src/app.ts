@@ -2,8 +2,8 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import cookie from '@fastify/cookie';
 import formbody from '@fastify/formbody';
 import fastifyStatic from '@fastify/static';
-import crypto from 'node:crypto';
 import { existsSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Provider } from 'oidc-provider';
@@ -24,6 +24,9 @@ import { argonFromConfig } from './security/argon.js';
 import { ChallengeStore } from './services/mfa.js';
 import { registerUiRoutes } from './ui/ui-routes.js';
 import { registerAccountRoutes } from './ui/account-routes.js';
+import { registerAdminRoutes, type AdministrationUI } from './ui/admin-routes.js';
+import { AdministrationService, type AccountAction, type AccountFilters, type AuditFilters } from './services/administration.js';
+import { registerServiceAuthzRoute, serviceAuthorizationFromAdministration } from './services/service-authz.js';
 import { layout } from './ui/layout.js';
 import type { Logger } from './logger.js';
 import { createLogger, nullLogger } from './logger.js';
@@ -152,19 +155,46 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
   const events = createAccountDeletedEmitter(db, config);
 
   const accounts = new AccountService({ config, db, store, tokens, mailer, breached: breachedChecker, limiter, events });
-  const sessions = new SessionManager({ config, store, tokens });
+  const sessions = new SessionManager({ config, store, tokens, db });
+  const administration = new AdministrationService({ db, config, store, tokens, sessions });
+  const authorization = serviceAuthorizationFromAdministration(administration);
   const challenges = new ChallengeStore();
 
   const app = Fastify({
     logger: false,
     // Il body dei form e' minuscolo; i limiti sono una barriera anti-DoS.
     bodyLimit: 128 * 1024,
-    trustProxy: true,
+    trustProxy: config.TRUST_PROXY,
     routerOptions: {
       // I nomi di campo del provider includono puntini: niente annidamento.
       caseSensitive: true,
       ignoreTrailingSlash: true,
     },
+  });
+  // Durable retries run only in a running non-test application. Consumer jti
+  // deduplication also protects against another instance attempting delivery.
+  let outboxTimer: ReturnType<typeof setInterval> | undefined;
+  let flushingOutbox = false;
+  app.addHook('onReady', async () => {
+    if (config.NODE_ENV === 'test') return;
+    outboxTimer = setInterval(async () => {
+      if (flushingOutbox) return;
+      flushingOutbox = true;
+      try { await events.flushPending(20); }
+      catch { logger.warn('retry outbox non disponibile'); }
+      finally { flushingOutbox = false; }
+    }, 30_000);
+    outboxTimer.unref();
+  });
+  app.addHook('onClose', async () => { if (outboxTimer) clearInterval(outboxTimer); });
+  app.addHook('onResponse', async (request, reply) => {
+    const pathname = (request.raw.url ?? '').split('?')[0] ?? '';
+    if (request.method !== 'POST' || !pathname.startsWith('/admin/') || reply.statusCode < 400) return;
+    const { sessionCookieName } = await import('./services/session-manager.js');
+    const active = await sessions.resolve(request.cookies?.[sessionCookieName(config)]);
+    await store.appendAudit({ actor: active ? `admin:${active.user.id}` : 'anonymous',
+      userId: active?.user.id ?? null, event: 'admin.request.rejected',
+      outcome: reply.statusCode >= 500 ? 'failure' : 'denied', ip: request.ip, metadata: {} });
   });
 
   await app.register(cookie, { secret: config.cookieSecret });
@@ -175,6 +205,17 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
     decorateReply: false,
     maxAge: 3600_000,
   });
+  // `tsx` serves src/static; fonts live in fontsource until the build copies
+  // them into dist. A strict two-file route keeps development local too.
+  if (config.NODE_ENV !== 'production') {
+    app.get('/static/fonts/:font/:file', async (request, reply) => {
+      const { font, file } = request.params as { font: string; file: string };
+      if (!['geist', 'inter'].includes(font) || file !== `${font}-latin-wght-normal.woff2`) return reply.code(404).send();
+      const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../node_modules/@fontsource-variable');
+      try { return reply.type('font/woff2').header('Cache-Control', 'public, max-age=3600').send(await readFile(path.join(root, font, 'files', file))); }
+      catch { return reply.code(404).send(); }
+    });
+  }
 
   /*
    * Origini autorizzate in `form-action` sulle pagine del flusso di
@@ -199,7 +240,7 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
   // Header di sicurezza su tutto, CSP inclusa.
   app.addHook('onRequest', async (request, reply) => {
     const path = (request.raw.url ?? '/').split('?')[0] ?? '/';
-    const isPage = request.method === 'GET' && (path.startsWith('/ui/') || path.startsWith('/account') || path === '/');
+    const isPage = request.method === 'GET' && (path.startsWith('/ui/') || path.startsWith('/account') || path.startsWith('/admin') || path === '/');
     applySecurityHeaders(request, reply, {
       isPage,
       hsts: config.hsts,
@@ -214,6 +255,14 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
   app.addHook('preValidation', async (request, reply) => {
     const path = (request.raw.url ?? '/').split('?')[0] ?? '/';
     if (!isCsrfProtected(request.method, request.raw.url ?? path)) return;
+    if (path === '/admin' || path.startsWith('/admin/')) {
+      const { sessionCookieName } = await import('./services/session-manager.js');
+      const active = await sessions.resolve(request.cookies?.[sessionCookieName(config)]);
+      const serviceId = (request.params as { serviceId?: string } | undefined)?.serviceId;
+      const authorized = active && (await administration.isGlobalAdmin(active.user.id) ||
+        (serviceId && (await administration.authorization(active.user.id, serviceId)).admin));
+      if (!authorized) return reply.code(404).send({ error: 'not_found' });
+    }
     const cookieValue = request.cookies?.[csrfCookieName(config.cookiePrefix)];
     const body = request.body as Record<string, unknown> | undefined;
     const { verifyCsrfToken } = await import('./security/csrf.js');
@@ -221,10 +270,6 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
     if (!verifyCsrfToken(typeof cookieValue === 'string' ? cookieValue : undefined, submitted)) {
       logger.warn('controllo CSRF fallito', {
         path,
-        a_hash: crypto.createHash('sha256').update(String(cookieValue ?? '')).digest('hex').slice(0, 8),
-        b_hash: crypto.createHash('sha256').update(String(submitted ?? '')).digest('hex').slice(0, 8),
-        a: String(cookieValue ?? '').slice(0, 6),
-        b: String(submitted ?? '').slice(0, 6),
       });
       return reply.code(403).type('text/html; charset=utf-8').send(
         layout({
@@ -240,7 +285,7 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
 
   const provider =
     options.provider ??
-    (await buildProvider({ config, store, tokens, argon: argonFromConfig(config) }));
+    (await buildProvider({ config, db, store, tokens, argon: argonFromConfig(config), authorization }));
 
   /*
    * Montaggio del provider.
@@ -289,21 +334,20 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
 
   /* --- rotte nostre ------------------------------------------------------ */
 
-  app.get('/', async (_request, reply) =>
-    reply.type('text/html; charset=utf-8').send(
+  app.get('/', async (request, reply) => {
+    const { sessionCookieName } = await import('./services/session-manager.js');
+    const active = await sessions.resolve(request.cookies?.[sessionCookieName(config)]);
+    if (active) return reply.redirect('/account', 303);
+    return reply.type('text/html; charset=utf-8').send(
       layout({
         title: 'Benvenuto',
-        body: `<h1>Engine Accounts</h1>
-<p class="lede">Identity provider della suite StreamingEngine. Non sa nulla dei servizi: conosce account, sessioni, client, scope e consensi.</p>
-<ul class="list">
-  <li><div><strong>Discovery</strong><br><span class="muted"><code>${config.issuer}/.well-known/openid-configuration</code></span></div></li>
-  <li><div><strong>Chiavi pubbliche</strong><br><span class="muted"><code>${config.issuer}/.well-known/jwks.json</code></span></div></li>
-  <li><div><strong>Accesso</strong></div><a class="button primary" href="/ui/login">Accedi</a></li>
-  <li><div><strong>Registrazione</strong></div><a class="button secondary" href="/ui/register">Crea un account</a></li>
-</ul>`,
+        body: `<section class="welcome panel"><p class="eyebrow">LA SUITE ENGINE · IDENTITÀ</p><h1>Il tuo account.<br>Un unico posto.</h1>
+<p class="lede">Profilo, accessi e sicurezza dei tuoi servizi Engine. Il controllo resta nelle tue mani.</p>
+<div class="row"><a class="button primary" href="/ui/login">Accedi al tuo account</a><a class="button secondary" href="/ui/register">Crea un account</a></div>
+<p class="hint">Se amministri Engine o uno dei suoi servizi, troverai i pannelli autorizzati dopo l’accesso.</p></section>`,
       }),
-    ),
-  );
+    );
+  });
 
   app.get('/healthz', async (_request, reply) => reply.send({ status: 'ok', service: 'engine-accounts' }));
 
@@ -318,7 +362,40 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
 
   registerUserinfoRoute(app, { config, store, jwks: () => activePublicJwks(config), allowedOrigins: clientOrigins });
   await registerUiRoutes(app, { config, store, tokens, accounts, sessions, provider, challenges });
-  await registerAccountRoutes(app, { config, store, accounts, sessions, challenges });
+  await registerAccountRoutes(app, { config, store, accounts, sessions, challenges, admin: administration, tokens });
+  await registerServiceAuthzRoute(app, { store, argon: argonFromConfig(config), limiter, authorization });
+  // Adapt form-boundary values to the service's validated domain types.
+  const admin: AdministrationUI = {
+    isGlobalAdmin: (sub) => administration.isGlobalAdmin(sub),
+    authorization: async (sub, serviceId) => {
+      const result = await administration.authorization(sub, serviceId);
+      return { ...result, status: result.status ?? 'deleted' };
+    },
+    listServices: () => administration.listServices(),
+    findService: (id) => administration.findService(id),
+    assignments: (id) => administration.assignments(id),
+    accounts: (filters) => administration.accounts(filters as AccountFilters),
+    accountDetail: (sub) => administration.accountDetail(sub),
+    mutateAccount: (actor, target, action, opts, context) => administration.mutateAccount(actor, target, action as AccountAction, opts, context),
+    setServiceEnabled: (actor, id, enabled, context) => administration.setServiceEnabled(actor, id, enabled, context),
+    grant: (actor, id, target, context) => administration.grant(actor, id, target, context),
+    revoke: (actor, id, target, context) => administration.revoke(actor, id, target, context),
+    setGlobalRole: (actor, target, enabled, options) => administration.setGlobalRole(actor, target, enabled, options),
+    listAudit: (filters) => administration.listAudit(filters as AuditFilters),
+    getSettings: () => administration.getSettings(),
+    setSetting: (actor, key, value, context) => administration.setSetting(actor, key,
+      typeof value !== 'string' ? value : ['EMAIL_VERIFICATION_REQUIRED', 'TOTP_REQUIRED', 'ADMIN_MFA_REQUIRED'].includes(key)
+        ? value === 'true' : key === 'REGISTRATION_MODE' ? value : Number(value), context),
+    diagnostics: () => administration.diagnostics(),
+  };
+  await registerAdminRoutes(app, { config, store, accounts, sessions, admin,
+    purge: async (actor, sub, serviceId, context) => {
+      const service = await administration.findService(serviceId);
+      if (!service?.enabled || !service.adminApiUrl) throw Object.assign(new Error('not_found'), { statusCode: 404 });
+      return administration.mutateAccount(actor, sub, 'purge', { serviceId,
+        purge: () => events.emitDataPurge(sub, service) }, context);
+    },
+  });
 
   app.setNotFoundHandler((request, reply) => {
     const path = (request.raw.url ?? '/').split('?')[0] ?? '/';
@@ -347,7 +424,7 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
       logger.error('errore non gestito', { err: message, path: (request.raw.url ?? '').split('?')[0] });
     }
     const path = (request.raw.url ?? '/').split('?')[0] ?? '/';
-    if (path.startsWith('/account') || path.startsWith('/ui/')) {
+    if (path.startsWith('/account') || path.startsWith('/ui/') || path.startsWith('/admin')) {
       // HTML per la nostra UI, senza dettagli interni nel messaggio.
       return reply
         .code(status)

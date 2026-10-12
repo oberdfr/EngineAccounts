@@ -1,5 +1,6 @@
 import type { AccountsStore } from '../domain/ports.js';
 import type { ClientRecord, ScopeRecord, ServiceRecord, User } from '../domain/types.js';
+import type { ServiceAuthorization } from '../services/service-authz.js';
 
 /**
  * Adapter `findAccount`: il nostro "modello account".
@@ -35,10 +36,12 @@ export async function findAccount(
   store: AccountsStore,
   _ctx: unknown,
   sub: string,
+  eligible?: (user: User) => Promise<boolean>,
 ): Promise<AccountAdapter | undefined> {
   const user = await store.findUserById(sub);
   // `undefined` = account inesistente: la libreria risponde 401 senza dire altro.
-  if (!user || user.status === 'deleted') return undefined;
+  if (!user || user.status !== 'active' || user.mustChangePassword) return undefined;
+  if (eligible && !await eligible(user)) return undefined;
 
   return {
     accountId: sub,
@@ -107,28 +110,39 @@ export function profileClaims(user: User, scope: string): Record<string, unknown
  */
 export async function accessTokenProfileClaims(
   store: AccountsStore,
-  token: { accountId?: unknown; scope?: unknown },
+  token: { accountId?: unknown; scope?: unknown; clientId?: unknown; resourceServer?: { audience?: unknown } },
+  authorization?: ServiceAuthorization,
 ): Promise<Record<string, unknown>> {
   // `accountId` assente = nessun utente (client credentials, o un token senza
   // soggetto): niente claim personali.
   if (typeof token.accountId !== 'string' || token.accountId.length === 0) return {};
   const scope = typeof token.scope === 'string' ? token.scope : '';
-  if (!scope.split(' ').includes('email')) return {};
-
+  if (!scope.split(' ').some((s) => s === 'email' || s === 'engine:admin')) return {};
   const user = await store.findUserById(token.accountId);
-  if (!user || user.status !== 'active') return {};
+  if (!user || user.status !== 'active' || user.mustChangePassword) return {};
+  const out: Record<string, unknown> = {};
+  if (scope.split(' ').includes('engine:admin') && typeof token.clientId === 'string' && authorization) {
+    const client = await store.findClient(token.clientId);
+    const audience = token.resourceServer?.audience;
+    const service = (await store.listServices()).find((s) => s.enabled && s.audience === audience);
+    if (client?.enabled && client.scope.includes('engine:admin') && client.audience === audience && service) {
+      const roles = await authorization.rolesFor(user.id, service.audience);
+      if (roles.includes('admin')) out.engine_roles = roles.includes('global') ? ['admin', 'global'] : ['admin'];
+    }
+  }
+  if (!scope.split(' ').includes('email')) return out;
   // Solo un indirizzo **utilizzabile**: il valore esce dal database cosi' com'e'
   // (nessuna normalizzazione qui, nessuna ricostruzione), ma una stringa vuota
   // o solo spazi non e' un indirizzo e non viene pubblicata come se lo fosse.
   // Il controllo viene prima di `profileClaims` perche' li l'indirizzo viene
   // usato come fallback del nome: una riga mezza vuota non deve far fallire
   // l'emissione del token.
-  if (typeof user.email !== 'string' || user.email.trim().length === 0) return {};
+  if (typeof user.email !== 'string' || user.email.trim().length === 0) return out;
 
   // Unica sorgente dei claim: id token, `/userinfo` e access token non possono
   // divergere, per costruzione.
   const profile = profileClaims(user, scope);
-  return { email: profile.email, email_verified: profile.email_verified === true };
+  return { ...out, email: profile.email, email_verified: profile.email_verified === true };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -136,7 +150,7 @@ export async function accessTokenProfileClaims(
 /* -------------------------------------------------------------------------- */
 
 /** Scope di base: vivono nel core (contratto 3). */
-export const CORE_SCOPES = ['openid', 'profile', 'email', 'offline_access'] as const;
+export const CORE_SCOPES = ['openid', 'profile', 'email', 'offline_access', 'engine:admin'] as const;
 
 /**
  * Scope supportati = base + righe di `streaming_scopes`. Nessun codice da
@@ -163,6 +177,7 @@ export async function resourceServerFor(
   resource: string,
   clientId?: string,
 ): Promise<{ scope: string; audience: string; accessTokenFormat: 'jwt' } | undefined> {
+  if (services.some((s) => s.audience === resource && !s.enabled)) return undefined;
   const known = new Set(services.filter((s) => s.enabled).map((s) => s.audience));
   for (const client of clients) {
     if (client.enabled) known.add(client.audience);
@@ -171,7 +186,7 @@ export async function resourceServerFor(
   if (clientId) {
     const client = clients.find((c) => c.clientId === clientId);
     // Un client puo' chiedere solo il proprio audience: niente confused deputy.
-    if (client && client.enabled && client.audience !== resource) return undefined;
+    if (!client || !client.enabled || client.audience !== resource) return undefined;
   }
   const service = services.find((s) => s.audience === resource && s.enabled);
   /*
@@ -200,8 +215,9 @@ export async function resourceServerFor(
    * manca anche nel bucket OIDC dello stesso grant (`op_scopes_missing` chiede
    * gia' il consenso).
    */
-  const scopes = (await store.listServiceScopes()).filter((s) => !service || s.serviceId === service.serviceId);
-  const scopeSet = new Set([...CORE_SCOPES, ...scopes.map((s) => s.scope)]);
+  const scopes = (await store.listServiceScopes()).filter((s) =>
+    s.scope === 'engine:admin' ? Boolean(service) : Boolean(service && s.serviceId === service.serviceId));
+  const scopeSet = new Set([...CORE_SCOPES.filter((s) => s !== 'engine:admin' || Boolean(service)), ...scopes.map((s) => s.scope)]);
   return {
     scope: [...scopeSet].join(' '),
     audience: resource,

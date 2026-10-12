@@ -17,6 +17,8 @@ import type { Mailer, MailMessage } from './mailer.js';
 import { emailChangeTemplate, magicCodeTemplate, passwordResetTemplate, verifyEmailTemplate } from './templates.js';
 import type { EventEmitter } from './account-deleted-event.js';
 import { createLogger } from '../logger.js';
+import { getEffectiveSettings, guardLastGlobalAdmin } from './administration.js';
+import { table } from '../db/pool.js';
 
 const logger = createLogger((process.env.LOG_LEVEL as never) ?? 'info', { svc: 'engine-accounts' });
 
@@ -78,6 +80,10 @@ export class AccountService {
   private now(): Date {
     return this.deps.now?.() ?? new Date();
   }
+  async effectivePolicy(): Promise<Config> {
+    const settings = await getEffectiveSettings(this.deps.db, this.config);
+    return { ...this.config, ...Object.fromEntries(settings.map((s) => [s.key, s.value])) } as Config;
+  }
 
   /* ------------------------------------------------------------------ */
   /* normalizzazione                                                      */
@@ -97,10 +103,11 @@ export class AccountService {
   /* ------------------------------------------------------------------ */
 
   async checkPassword(password: string): Promise<PasswordPolicyResult> {
+    const policy = await this.effectivePolicy();
     if (!password || password.length === 0) return { ok: false, reason: 'empty' };
     // Limite inferiore 12: sotto, la forza e' piu\' una barriera d'ingresso che
     // una protezione. Limite superiore = tetto anti-DoS (vedi security/password.ts).
-    if (password.length < this.config.PASSWORD_MIN_LENGTH) return { ok: false, reason: 'too_short' };
+    if (password.length < policy.PASSWORD_MIN_LENGTH) return { ok: false, reason: 'too_short' };
     if (Buffer.byteLength(password, 'utf8') > this.config.PASSWORD_MAX_LENGTH * 4) {
       return { ok: false, reason: 'too_long' };
     }
@@ -123,6 +130,8 @@ export class AccountService {
     input: { email: string; password: string; displayName?: string | null },
     ctx: RequestContext,
   ): Promise<{ accepted: true; message: string; createdUserId?: string }> {
+    const settings = await this.effectivePolicy();
+    if (settings.REGISTRATION_MODE !== 'open') return { accepted: true, message: NEUTRAL_REGISTRATION };
     const email = AccountService.normalizeEmail(input.email);
     const ipKey = ctx.ip ?? 'unknown';
 
@@ -214,7 +223,7 @@ export class AccountService {
    */
   private async sendVerificationEmail(user: User, _ctx: RequestContext): Promise<void> {
     const token = crypto.randomBytes(32).toString('base64url');
-    const ttl = this.config.EMAIL_VERIFICATION_TTL;
+    const ttl = (await this.effectivePolicy()).EMAIL_VERIFICATION_TTL;
     await this.store.invalidateAccountTokens(user.id, 'email_verification');
     await this.store.createAccountToken({
       userId: user.id,
@@ -360,6 +369,7 @@ export class AccountService {
     if (user.status === 'deleted') {
       return { status: 'invalid' };
     }
+    if ((await this.effectivePolicy()).EMAIL_VERIFICATION_REQUIRED && !user.emailVerifiedAt) return { status: 'unverified' };
 
     // Lockout scaduto e password corretta: si azzera il contatore.
     this.deps.limiter.registerAccountSuccess(accountKey);
@@ -409,7 +419,7 @@ export class AccountService {
     }
 
     const token = crypto.randomBytes(32).toString('base64url');
-    const ttl = this.config.PASSWORD_RESET_TTL;
+    const ttl = (await this.effectivePolicy()).PASSWORD_RESET_TTL;
     await this.store.invalidateAccountTokens(user.id, 'password_reset');
     await this.store.createAccountToken({
       userId: user.id,
@@ -462,8 +472,10 @@ export class AccountService {
     }
 
     await this.store.consumeAccountToken(record.id);
+    const user = await this.store.findUserById(record.userId);
+    if (!user || user.status !== 'active') return { ok: false, message: 'Account non attivo.' };
     const passwordHash = await hashPassword(newPassword, this.config);
-    await this.store.updateUser(record.userId, { passwordHash, failedLogins: 0, lockedUntil: null });
+    await this.store.updateUser(record.userId, { passwordHash, mustChangePassword: false, failedLogins: 0, lockedUntil: null });
     // Cambiamento di password = revoca di tutto quello che era gia' stato emesso.
     const revokedSessions = await this.store.revokeAllSessions(record.userId, 'password_reset');
     const revokedTokens = await this.deps.tokens.revokeUserGrants(record.userId);
@@ -494,8 +506,11 @@ export class AccountService {
     newPassword: string,
     ctx: RequestContext,
   ): Promise<{ ok: boolean; message: string; reason?: string }> {
+    if (!this.deps.limiter.checkIp(`password-change:${ctx.ip ?? 'unknown'}`, 10, 60_000).allowed) {
+      return { ok: false, message: 'Troppi tentativi. Riprova più tardi.', reason: 'rate_limited' };
+    }
     const user = await this.store.findUserById(userId);
-    if (!user) return { ok: false, message: 'Account non trovato.' };
+    if (!user || user.status !== 'active') return { ok: false, message: 'Account non attivo.' };
 
     const currentOk = await verifyPassword(user.passwordHash, currentPassword, this.config);
     if (!currentOk) {
@@ -521,7 +536,7 @@ export class AccountService {
         metadata: { reason: policy.reason },
       });
       const messages: Record<string, string> = {
-        too_short: `La password deve avere almeno ${this.config.PASSWORD_MIN_LENGTH} caratteri.`,
+        too_short: `La password deve avere almeno ${(await this.effectivePolicy()).PASSWORD_MIN_LENGTH} caratteri.`,
         too_long: 'Password troppo lunga.',
         compromised: 'Questa password compare in elenchi di password compromesse: scegline un\'altra.',
         common: 'Questa password e\' troppo comune: scegline un\'altra.',
@@ -535,7 +550,7 @@ export class AccountService {
     }
 
     const passwordHash = await hashPassword(newPassword, this.config);
-    await this.store.updateUser(userId, { passwordHash, failedLogins: 0, lockedUntil: null });
+    await this.store.updateUser(userId, { passwordHash, mustChangePassword: false, failedLogins: 0, lockedUntil: null });
     const revokedTokens = await this.deps.tokens.revokeUserGrants(userId);
     await this.store.appendAudit({
       userId,
@@ -573,7 +588,7 @@ export class AccountService {
     }
 
     const token = crypto.randomBytes(32).toString('base64url');
-    const ttl = this.config.EMAIL_CHANGE_TTL;
+    const ttl = (await this.effectivePolicy()).EMAIL_CHANGE_TTL;
     await this.store.invalidateAccountTokens(userId, 'email_change');
     await this.store.createAccountToken({
       userId,
@@ -656,15 +671,16 @@ export class AccountService {
     }
 
     const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
+    const magicTtl = (await this.effectivePolicy()).MAGIC_CODE_TTL;
     await this.store.createAccountToken({
       userId: user.id,
       purpose: 'magic_code',
       tokenDigest: this.digest(code),
-      expiresAt: new Date(this.now().getTime() + this.config.MAGIC_CODE_TTL * 1000),
+      expiresAt: new Date(this.now().getTime() + magicTtl * 1000),
       targetEmail: user.email,
       payload: {},
     });
-    const minutes = Math.round(this.config.MAGIC_CODE_TTL / 60);
+    const minutes = Math.round(magicTtl / 60);
     const template = magicCodeTemplate({ config: this.config, code: formatMagicCode(code), minutes });
     await this.sendMail(user.id, { to: user.email, ...template }, 'magic_code');
     await this.store.appendAudit({
@@ -705,6 +721,8 @@ export class AccountService {
       return { status: 'invalid', retryAfterSeconds: verdict.retryAfterSeconds };
     }
     if (user.status === 'blocked') return { status: 'blocked' };
+    if (user.status !== 'active') return { status: 'invalid' };
+    if ((await this.effectivePolicy()).EMAIL_VERIFICATION_REQUIRED && !user.emailVerifiedAt) return { status: 'unverified' };
     await this.store.consumeAccountToken(record.id);
     this.deps.limiter.registerAccountSuccess(normalized);
     return { status: 'ok', user };
@@ -746,10 +764,60 @@ export class AccountService {
       return { ok: false, message: 'Password non corretta.', reason: 'reauth_failed' };
     }
 
+    return this.executeDeletion(userId, ctx);
+  }
+
+  async deleteAccountAsAdmin(
+    actorSub: string,
+    targetSub: string,
+    reauth: { password: string; totpCode?: string },
+    ctx: RequestContext,
+  ): Promise<{ ok: boolean; message: string; reason?: string; eventsSent?: number }> {
+    const actor = await this.deps.db.one<{ password_hash: string; must_change_password: boolean }>(
+      `SELECT password_hash,must_change_password FROM ${table(this.deps.db, 'users')} WHERE id=$1 AND status='active' AND is_global_admin`, [actorSub],
+    );
+    if (!actor || actor.must_change_password) return { ok: false, message: 'Operazione non autorizzata.', reason: 'forbidden' };
+    if (!this.deps.limiter.checkIp(`admin-delete:${ctx.ip ?? 'unknown'}`, 10, 60_000).allowed) return { ok: false, message: 'Troppi tentativi.', reason: 'rate_limited' };
+    if (!await verifyPassword(actor.password_hash, reauth.password, this.config)) return { ok: false, message: 'Password non corretta.', reason: 'reauth_failed' };
+    return this.executeDeletion(targetSub, ctx, actorSub);
+  }
+
+  private async executeDeletion(
+    userId: string,
+    ctx: RequestContext,
+    actorSub?: string,
+  ): Promise<{ ok: boolean; message: string; reason?: string; eventsSent?: number }> {
+    const target = await this.store.findUserById(userId);
+    if (!target || target.status === 'deleted') return { ok: false, message: 'Account non trovato.' };
+
     // Client che hanno ottenuto un consenso: ricevono l'evento.
     const clients = (await this.store.listClients()).filter(
       (c) => c.enabled && c.backchannelEventsUri,
     );
+
+    // Protect and perform the status transition on the SAME transaction client.
+    // No authentication material is removed if this is the last global admin.
+    const tombstoneEmail = `deleted+${userId.replace(/-/g, '')}@deleted.invalid`;
+    const randomHash = await hashPassword(crypto.randomBytes(32).toString('base64url'), this.config);
+    try {
+      await this.deps.db.tx(async (client) => {
+        await guardLastGlobalAdmin(this.deps.db, userId, { client });
+        if (actorSub) {
+          const actor = await client.query(`SELECT id FROM ${table(this.deps.db, 'users')} WHERE id=$1 AND status='active' AND is_global_admin AND NOT must_change_password FOR UPDATE`, [actorSub]);
+          if (!actor.rows.length) throw new Error('admin_deletion_forbidden');
+        }
+        await client.query(`UPDATE ${table(this.deps.db, 'users')} SET email=$2,password_hash=$3,
+          display_name=NULL,email_verified_at=NULL,totp_enabled=false,status='deleted',
+          is_global_admin=false,must_change_password=false,deleted_at=$4,failed_logins=0,locked_until=NULL,updated_at=$4
+          WHERE id=$1 AND status<>'deleted'`, [userId, tombstoneEmail, randomHash, this.now()]);
+        await client.query(`DELETE FROM ${table(this.deps.db, 'service_admin_assignments')} WHERE user_id=$1`, [userId]);
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('last_active_global_admin')) {
+        return { ok: false, message: 'Non puoi eliminare l’ultimo amministratore globale attivo.', reason: 'last_active_global_admin' };
+      }
+      throw error;
+    }
 
     // 1. revoca di tutto il materiale autenticativo
     await this.store.revokeAllSessions(userId, 'account_deleted');
@@ -764,25 +832,10 @@ export class AccountService {
     await this.store.invalidateAccountTokens(userId, 'magic_code');
     await this.store.invalidateAccountTokens(userId, 'email_change');
 
-    // 2. anonimizzazione: la riga resta (sub stabile), i dati no.
-    //    L'hash della password diventa casuale: nessun login e' possibile.
-    const tombstoneEmail = `deleted+${userId.replace(/-/g, '')}@deleted.invalid`;
-    const randomHash = await hashPassword(crypto.randomBytes(32).toString('base64url'), this.config);
-    await this.store.updateUser(userId, {
-      email: tombstoneEmail,
-      passwordHash: randomHash,
-      displayName: null,
-      emailVerifiedAt: null,
-      totpEnabled: false,
-      status: 'deleted',
-      deletedAt: this.now(),
-      failedLogins: 0,
-      lockedUntil: null,
-    });
-
     await this.store.appendAudit({
       userId,
       subjectId: userId,
+      actor: actorSub ? `admin:${actorSub}` : undefined,
       event: 'account_delete.success',
       outcome: 'success',
       ip: ctx.ip,

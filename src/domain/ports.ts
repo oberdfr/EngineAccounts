@@ -43,7 +43,7 @@ export interface AccountsStore {
   findSessionByTokenDigest(digest: string): Promise<SessionRecord | undefined>;
   touchSession(id: string): Promise<void>;
   linkProviderSession(id: string, providerSessionId: string, providerSessionUid: string | null): Promise<void>;
-  listSessions(userId: string): Promise<SessionRecord[]>;
+  listSessions(userId: string, includeInactive?: boolean): Promise<SessionRecord[]>;
   revokeSession(id: string, reason: string): Promise<SessionRecord | undefined>;
   revokeAllSessions(userId: string, reason: string, exceptId?: string): Promise<string[]>;
 

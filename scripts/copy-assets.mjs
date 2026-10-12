@@ -13,6 +13,14 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 /** Coppie (sorgente, destinazione): tutto cio` che `tsc` non tocca. */
 const ASSETS = [
+  ...['geist', 'inter'].map((font) => [
+    path.join(root, 'node_modules', '@fontsource-variable', font, 'files'),
+    path.join(root, 'dist', 'ui', 'static', 'fonts', font),
+  ]),
+  ...['geist', 'inter'].map((font) => [
+    path.join(root, 'node_modules', '@fontsource-variable', font, 'LICENSE'),
+    path.join(root, 'dist', 'ui', 'static', 'fonts', font, 'LICENSE'),
+  ]),
   [path.join(root, 'src', 'ui', 'static'), path.join(root, 'dist', 'ui', 'static')],
   [path.join(root, 'src', 'security', 'data'), path.join(root, 'dist', 'security', 'data')],
 ];

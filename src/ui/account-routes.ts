@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { Config } from '../config.js';
-import type { AccountsStore } from '../domain/ports.js';
+import type { AccountsStore, OidcTokenStore } from '../domain/ports.js';
+import type { User } from '../domain/types.js';
 import type { AccountService } from '../services/account-service.js';
 import { holdFor } from '../security/timing.js';
 import { CSRF_FIELD, csrfCookieName, issueCsrfToken, verifyCsrfToken } from '../security/csrf.js';
@@ -12,12 +13,15 @@ import {
   resetRecoveryCodes,
   rpIDFromIssuer,
   startTotpEnrolment,
+  renderTotpQrSvg,
   webauthnRegistrationOptions,
   type ChallengeStore,
 } from '../services/mfa.js';
 import { sessionCookieName, type SessionManager } from '../services/session-manager.js';
 import { maskEmail } from '../services/mailer.js';
 import * as pages from '../ui/pages.js';
+import { csrfInput, esc, layout } from './layout.js';
+import type { AdministrationService } from '../services/administration.js';
 
 /**
  * Pannello di gestione account (`/account/*`).
@@ -33,6 +37,8 @@ export interface AccountDeps {
   accounts: AccountService;
   sessions: SessionManager;
   challenges: ChallengeStore;
+  admin?: Pick<AdministrationService, 'listServices' | 'authorization'>;
+  tokens?: OidcTokenStore;
 }
 
 export async function registerAccountRoutes(app: FastifyInstance, deps: AccountDeps): Promise<void> {
@@ -41,6 +47,32 @@ export async function registerAccountRoutes(app: FastifyInstance, deps: AccountD
 
   const csrfCookie = csrfCookieName(config.cookiePrefix);
   const sessionCookie = sessionCookieName(config);
+
+  const accountContext = async (user: User) => ({
+    email: user.email,
+    displayName: user.displayName,
+    isGlobalAdmin: Boolean(user.isGlobalAdmin),
+    adminDestinations: user.isGlobalAdmin ? [] : (await serviceRoles(user.id)).map(s => ({ href: `/admin/services/${encodeURIComponent(s.serviceId)}`, label: s.name })),
+    userId: user.id,
+    status: user.status,
+    updatedAt: user.updatedAt,
+    account: {
+      id: user.id, status: user.status, createdAt: user.createdAt, updatedAt: user.updatedAt,
+      lastLoginAt: user.lastLoginAt, emailVerifiedAt: user.emailVerifiedAt,
+       mustChangePassword: user.mustChangePassword, isGlobalAdmin: user.isGlobalAdmin,
+       totpEnabled: user.totpEnabled, failedLogins: user.failedLogins, lockedUntil: user.lockedUntil, blockedReason: user.blockedReason,
+    },
+  });
+
+  async function serviceRoles(userId: string) {
+    if (!deps.admin) return [];
+    const services = await deps.admin.listServices();
+    const roles = await Promise.all(services.map(async (service) => ({
+      serviceId: service.serviceId, name: service.name,
+      admin: (await deps.admin!.authorization(userId, service.serviceId)).admin,
+    })));
+    return roles.filter((role) => role.admin);
+  }
 
   function ensureCsrf(request: FastifyRequest, reply: FastifyReply): string {
     const existing = request.cookies?.[csrfCookie];
@@ -82,6 +114,22 @@ export async function registerAccountRoutes(app: FastifyInstance, deps: AccountD
       reply.redirect(`/ui/login?next=${encodeURIComponent(request.url)}`, 303);
       return undefined;
     }
+    reply.header('Cache-Control', 'no-store');
+    if (active.user.mustChangePassword) {
+      reply.redirect('/ui/force-password-change', 303);
+      return undefined;
+    }
+    const settings = await accounts.effectivePolicy();
+    if (settings.EMAIL_VERIFICATION_REQUIRED && !active.user.emailVerifiedAt) {
+      reply.code(403).send({ error: 'email_verification_required' });
+      return undefined;
+    }
+    if (settings.TOTP_REQUIRED && !active.user.totpEnabled && ![
+      '/account/security', '/account/security/totp/setup', '/account/security/totp/confirm', '/account/logout',
+    ].includes(request.url.split('?')[0]!)) {
+      reply.redirect('/account/security/totp/setup', 303);
+      return undefined;
+    }
     return active;
   }
 
@@ -102,26 +150,44 @@ export async function registerAccountRoutes(app: FastifyInstance, deps: AccountD
     if (!active) return reply;
     const csrf = ensureCsrf(request, reply);
     const { user, session } = active;
-    const [sessionList, consents, credentials, recoveryLeft] = await Promise.all([
-      sessions.list(user.id),
+    const [sessionOverview, consents, credentials, recoveryLeft] = await Promise.all([
+      sessions.overview(user.id, session.id),
       store.listConsents(user.id),
       store.listWebauthnCredentials(user.id),
       store.countUnusedRecoveryCodes(user.id),
     ]);
     return reply.type('text/html; charset=utf-8').send(
       pages.accountHomePage({
+          ...await accountContext(user),
+        ...{ sessionOverview, currentSession: sessionOverview.groups.flatMap((g) => g.sessions).find((s) => s.current) },
         csrf,
         email: user.email,
         displayName: user.displayName,
         emailVerified: Boolean(user.emailVerifiedAt),
         createdAt: user.createdAt,
-        sessions: sessionList.filter((s) => s.id === session.id || true).length,
-        consents: consents.length,
+        sessions: sessionOverview.counts.active,
+        consents: consents.filter((c) => !c.revokedAt && (!c.expiresAt || c.expiresAt.getTime() > Date.now())).length,
+        lastActivity: user.lastLoginAt,
+        isGlobalAdmin: Boolean(user.isGlobalAdmin),
         hasTotp: user.totpEnabled,
         passkeys: credentials.length,
         recoveryLeft,
       }),
     );
+  });
+
+  app.get('/account/profile', async (request, reply) => {
+    const active = await requireSession(request, reply);
+    if (!active) return reply;
+    const query = (request.query ?? {}) as { saved?: string; email?: string };
+    return reply.type('text/html; charset=utf-8').send(pages.accountProfilePage({
+      ...await accountContext(active.user),
+      csrf: ensureCsrf(request, reply),
+      emailVerified: Boolean(active.user.emailVerifiedAt),
+      flash: query.saved === '1' ? { kind: 'ok', text: 'Nome aggiornato.' }
+        : query.email === 'sent' ? { kind: 'info', text: 'Controlla il nuovo indirizzo email per confermare la modifica.' }
+        : query.email === 'failed' ? { kind: 'error', text: 'Non è stato possibile richiedere la modifica dell’email.' } : undefined,
+    }));
   });
 
   app.get('/account/security', async (request, reply) => {
@@ -134,6 +200,7 @@ export async function registerAccountRoutes(app: FastifyInstance, deps: AccountD
     ]);
     return reply.type('text/html; charset=utf-8').send(
       pages.accountSecurityPage({
+        ...await accountContext(active.user),
         csrf: ensureCsrf(request, reply),
         email: active.user.email,
         hasTotp: active.user.totpEnabled,
@@ -143,9 +210,13 @@ export async function registerAccountRoutes(app: FastifyInstance, deps: AccountD
           label: c.nickname ?? `Passkey ${c.credentialId.slice(-6)}`,
         })),
         recoveryLeft,
-        flash: (request.query as { done?: string } | undefined)?.done
-          ? { kind: 'ok', text: 'Fatto.' }
-          : undefined,
+        flash: (request.query as { error?: string } | undefined)?.error === 'passkey'
+          ? { kind: 'error', text: 'La passkey non è stata registrata. La richiesta potrebbe essere scaduta, annullata o non valida. Avvia una nuova registrazione dalla sezione Passkey.' }
+          : (request.query as { admin?: string } | undefined)?.admin === 'mfa-required'
+          ? { kind: 'info', text: 'Per accedere all’Amministrazione devi prima attivare un secondo fattore: TOTP oppure una passkey. Configuralo qui, poi riapri il pannello Amministrazione.' }
+          : (request.query as { done?: string } | undefined)?.done
+            ? { kind: 'ok', text: 'Fatto.' }
+            : undefined,
       }),
     );
   });
@@ -153,13 +224,17 @@ export async function registerAccountRoutes(app: FastifyInstance, deps: AccountD
   app.get('/account/sessions', async (request, reply) => {
     const active = await requireSession(request, reply);
     if (!active) return reply;
-    const list = await sessions.list(active.user.id);
+    const sessionOverview = await sessions.overview(active.user.id, active.session.id);
     return reply.type('text/html; charset=utf-8').send(
       pages.accountSessionsPage({
+        ...await accountContext(active.user),
+        ...{ sessionOverview },
         csrf: ensureCsrf(request, reply),
         email: active.user.email,
-        sessions: list.map((s) => ({ ...s, current: s.id === active.session.id })),
-        flash: (request.query as { revoked?: string } | undefined)?.revoked
+        sessions: sessionOverview.groups.flatMap((g) => g.sessions),
+        flash: (request.query as { revoked?: string } | undefined)?.revoked === 'all'
+          ? { kind: 'ok', text: 'Tutte le altre sessioni sono state revocate. Questa sessione resta attiva.' }
+          : (request.query as { revoked?: string } | undefined)?.revoked
           ? { kind: 'ok', text: 'Sessione revocata.' }
           : undefined,
       }),
@@ -172,6 +247,7 @@ export async function registerAccountRoutes(app: FastifyInstance, deps: AccountD
     const consents = await store.listConsents(active.user.id);
     return reply.type('text/html; charset=utf-8').send(
       pages.accountAppsPage({
+        ...await accountContext(active.user),
         csrf: ensureCsrf(request, reply),
         email: active.user.email,
         consents,
@@ -182,12 +258,38 @@ export async function registerAccountRoutes(app: FastifyInstance, deps: AccountD
     );
   });
 
+  app.get('/account/services', async (request, reply) => {
+    const active = await requireSession(request, reply);
+    if (!active) return reply;
+    const csrf = ensureCsrf(request, reply);
+    const [services, clients, consents] = await Promise.all([
+      deps.admin ? deps.admin.listServices() : store.listServices(), store.listClients(), store.listConsents(active.user.id),
+    ]);
+    const groups = await Promise.all(services.map(async (service) => {
+      const serviceClients = clients.filter((c) => c.audience === service.audience);
+      const linked = consents.filter((c) => serviceClients.some((client) => client.clientId === c.clientId));
+      const role = deps.admin ? await deps.admin.authorization(active.user.id, service.serviceId) : { admin: false };
+      if (!linked.length && !role.admin) return '';
+      const adminUrl = 'adminUrl' in service ? service.adminUrl : null;
+      const enabled = service.enabled && serviceClients.some((c) => c.enabled);
+      return `<section class="panel"><h2>${esc(service.name)} ${role.admin && enabled ? '<span class="badge">Admin</span>' : ''}</h2>
+        <p><code>${esc(service.audience)}</code> · ${enabled ? 'Disponibile' : 'Disabilitato'}</p>
+        ${role.admin && enabled ? `<p><a href="/admin/services/${encodeURIComponent(service.serviceId)}">Amministra collegamenti</a>${pages.safeExternalUrl(adminUrl) ? ` · <a href="${esc(adminUrl)}">Apri amministrazione servizio</a>` : ''}</p>` : ''}
+        ${linked.length ? `<ul class="list">${linked.map((c) => `<li><div><strong>${esc(c.clientName)}</strong><p><code>${esc(c.clientId)}</code></p><p>Scope: ${esc(c.scope.join(' '))}</p><p>Concesso: ${esc(c.grantedAt.toISOString())}${c.revokedAt ? ' · Revocato' : ''}</p></div>${!c.revokedAt ? `<form method="post" action="/account/apps/revoke">${csrfInput(csrf)}<input type="hidden" name="clientId" value="${esc(c.clientId)}"><button class="secondary">Revoca consenso</button></form>` : ''}</li>`).join('')}</ul>` : '<p>Nessun consenso concesso.</p>'}</section>`;
+    }));
+    return reply.header('Cache-Control', 'no-store').type('text/html; charset=utf-8').send(layout({
+      title: 'Servizi collegati', width: 'wide', csrf, userEmail: active.user.email, admin: Boolean(active.user.isGlobalAdmin), adminDestinations: (await accountContext(active.user)).adminDestinations,
+      body: `<h1>Servizi collegati</h1><p>I collegamenti usano il normale SSO, senza token amministrativi nell’URL.</p>${groups.join('') || '<p>Nessun servizio collegato.</p>'}`,
+    }));
+  });
+
   app.get('/account/activity', async (request, reply) => {
     const active = await requireSession(request, reply);
     if (!active) return reply;
     const [entries, total] = await Promise.all([store.listAudit(active.user.id, 100), store.countAudit(active.user.id)]);
     return reply.type('text/html; charset=utf-8').send(
       pages.accountActivityPage({
+        ...await accountContext(active.user),
         csrf: ensureCsrf(request, reply),
         email: active.user.email,
         entries: entries.map((e) => ({
@@ -207,6 +309,7 @@ export async function registerAccountRoutes(app: FastifyInstance, deps: AccountD
     if (!active) return reply;
     return reply.type('text/html; charset=utf-8').send(
       pages.accountExportPage({
+        ...await accountContext(active.user),
         csrf: ensureCsrf(request, reply),
         email: active.user.email,
         downloadUrl: '/account/export.json',
@@ -229,7 +332,7 @@ export async function registerAccountRoutes(app: FastifyInstance, deps: AccountD
     const active = await requireSession(request, reply);
     if (!active) return reply;
     return reply.type('text/html; charset=utf-8').send(
-      pages.accountDeletePage({ csrf: ensureCsrf(request, reply), email: active.user.email }),
+      pages.accountDeletePage({ ...await accountContext(active.user), csrf: ensureCsrf(request, reply), email: active.user.email }),
     );
   });
 
@@ -283,6 +386,7 @@ export async function registerAccountRoutes(app: FastifyInstance, deps: AccountD
     if (!(await requirePassword(active.user.id, body.password))) {
       return reply.code(403).type('text/html; charset=utf-8').send(
         pages.accountProfilePage({
+          ...await accountContext(active.user),
           csrf: ensureCsrf(request, reply),
           email: active.user.email,
           displayName: active.user.displayName,
@@ -328,6 +432,7 @@ export async function registerAccountRoutes(app: FastifyInstance, deps: AccountD
     ]);
     return reply.code(400).type('text/html; charset=utf-8').send(
       pages.accountSecurityPage({
+        ...(user ? await accountContext(user) : {}),
         csrf: ensureCsrf(request, reply),
         email: user?.email ?? '',
         hasTotp: user?.totpEnabled ?? false,
@@ -342,12 +447,13 @@ export async function registerAccountRoutes(app: FastifyInstance, deps: AccountD
   app.get('/account/security/totp/setup', async (request, reply) => {
     const active = await requireSession(request, reply);
     if (!active) return reply;
+    if (active.user.totpEnabled || (await store.getTotp(active.user.id))?.confirmedAt) return reply.redirect('/account/security', 303);
     // Il segreto appena generato vive in challenge: non finisce nell'URL.
     const { secret, uri } = await startTotpEnrolment(store, config, active.user);
     challenges.set(`totp-setup:${active.user.id}`, { kind: 'totp', value: secret, createdAt: Date.now() });
     return reply
       .type('text/html; charset=utf-8')
-      .send(pages.totpSetupPage({ csrf: ensureCsrf(request, reply), email: active.user.email, secret, uri }));
+      .send(pages.totpSetupPage({ ...await accountContext(active.user), csrf: ensureCsrf(request, reply), email: active.user.email, secret, uri, qrSvg: await renderTotpQrSvg(uri), invalid: (request.query as { invalid?: string }).invalid === '1' }));
   });
 
   app.post('/account/security/totp/confirm', async (request, reply) => {
@@ -386,6 +492,7 @@ export async function registerAccountRoutes(app: FastifyInstance, deps: AccountD
     if (!active) return reply;
     if (!checkCsrf(request)) return csrfFailure(reply);
     const body = (request.body ?? {}) as Record<string, unknown>;
+    if ((await accounts.effectivePolicy()).TOTP_REQUIRED) return reply.code(403).send({ error: 'totp_required' });
     if (!(await requirePassword(active.user.id, body.password))) {
       return renderSecurityError(request, reply, active.user.id, ['Password attuale non corretta.']);
     }
@@ -404,8 +511,8 @@ export async function registerAccountRoutes(app: FastifyInstance, deps: AccountD
   app.get('/account/security/webauthn/register', async (request, reply) => {
     const active = await requireSession(request, reply);
     if (!active) return reply;
-    const options = await webauthnRegistrationOptions(config, active.user);
-    challenges.set(`webauthn-register:${active.user.id}`, {
+    const options = await webauthnRegistrationOptions(config, active.user, await store.listWebauthnCredentials(active.user.id));
+    challenges.set(`webauthn-register:${active.session.id}`, {
       kind: 'webauthn',
       value: options.challenge,
       createdAt: Date.now(),
@@ -414,6 +521,7 @@ export async function registerAccountRoutes(app: FastifyInstance, deps: AccountD
       .type('text/html; charset=utf-8')
       .send(
         pages.webauthnRegisterPage({
+          ...await accountContext(active.user),
           csrf: ensureCsrf(request, reply),
           email: active.user.email,
           optionsJson: JSON.stringify(options),
@@ -426,9 +534,11 @@ export async function registerAccountRoutes(app: FastifyInstance, deps: AccountD
     if (!active) return reply;
     if (!checkCsrf(request)) return csrfFailure(reply);
     const body = (request.body ?? {}) as Record<string, unknown>;
-    const challenge = challenges.take(`webauthn-register:${active.user.id}`);
-    if (!challenge) return reply.redirect('/account/security?done=1', 303);
-    const parsed = JSON.parse(String(body.webauthnResponse ?? '{}')) as unknown;
+    const challenge = challenges.take(`webauthn-register:${active.session.id}`);
+    if (!challenge || challenge.kind !== 'webauthn') return reply.redirect('/account/security?error=passkey', 303);
+    let parsed: unknown;
+    try { parsed = JSON.parse(String(body.webauthnResponse ?? '{}')) as unknown; }
+    catch { return reply.redirect('/account/security?error=passkey', 303); }
     const result = await completeWebauthnRegistration(config, parsed, challenge.value, { id: active.user.id });
     if (!result.verified || !result.draft) {
       await store.appendAudit({
@@ -441,7 +551,7 @@ export async function registerAccountRoutes(app: FastifyInstance, deps: AccountD
       });
       return reply.redirect('/account/security?error=passkey', 303);
     }
-    await store.addWebauthnCredential({ userId: active.user.id, ...result.draft });
+    await store.addWebauthnCredential({ userId: active.user.id, ...result.draft, nickname: typeof body.nickname === 'string' ? body.nickname.trim().slice(0, 64) || null : null });
     await store.appendAudit({
       userId: active.user.id,
       event: 'webauthn.registered',
@@ -496,7 +606,7 @@ export async function registerAccountRoutes(app: FastifyInstance, deps: AccountD
     });
     // I codici si vedono una volta sola: nessun modo per recuperarli dopo.
     return reply.type('text/html; charset=utf-8').send(
-      pages.recoveryCodesPage({ csrf: ensureCsrf(request, reply), email: active.user.email, codes }),
+      pages.recoveryCodesPage({ ...await accountContext(active.user), csrf: ensureCsrf(request, reply), email: active.user.email, codes }),
     );
   });
 
@@ -505,15 +615,24 @@ export async function registerAccountRoutes(app: FastifyInstance, deps: AccountD
     if (!active) return reply;
     if (!checkCsrf(request)) return csrfFailure(reply);
     const body = (request.body ?? {}) as Record<string, unknown>;
-    await sessions.revoke(String(body.sessionId ?? ''), 'user_revoked', active.user.id);
+    const sessionId = String(body.sessionId ?? '');
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId)) {
+      return reply.code(400).send({ error: 'invalid_session_id' });
+    }
+    const revoked = await sessions.revoke(sessionId, 'user_revoked', active.user.id);
+    if (!revoked) return reply.code(404).send({ error: 'session_not_found' });
     await store.appendAudit({
       userId: active.user.id,
       event: 'session.revoked',
       outcome: 'info',
       ip: request.ip ?? null,
       userAgent: (request.headers['user-agent'] as string | undefined) ?? null,
-      metadata: { session_id: String(body.sessionId ?? '') },
+      metadata: { session_id: sessionId },
     });
+    if (sessionId === active.session.id) {
+      reply.clearCookie(sessionCookie, sessions.cookieOptions());
+      return reply.redirect('/ui/login', 303);
+    }
     return reply.redirect('/account/sessions?revoked=1', 303);
   });
 
@@ -530,7 +649,7 @@ export async function registerAccountRoutes(app: FastifyInstance, deps: AccountD
       userAgent: (request.headers['user-agent'] as string | undefined) ?? null,
       metadata: { count },
     });
-    return reply.redirect('/account/sessions?revoked=1', 303);
+    return reply.redirect('/account/sessions?revoked=all', 303);
   });
 
   app.post('/account/apps/revoke', async (request, reply) => {
@@ -540,6 +659,11 @@ export async function registerAccountRoutes(app: FastifyInstance, deps: AccountD
     const body = (request.body ?? {}) as Record<string, unknown>;
     const clientId = String(body.clientId ?? '');
     await store.revokeConsent(active.user.id, clientId);
+    if (deps.tokens) {
+      const tokens = await deps.tokens.listUserTokens(active.user.id);
+      const grantIds = new Set(tokens.filter((t) => t.clientId === clientId && t.grantId).map((t) => t.grantId!));
+      for (const grantId of grantIds) await deps.tokens.revokeByGrantId(grantId);
+    }
     // I token gia' emessi restano validi fino a scadenza: e' il comportamento
     // atteso da chi revoca un consenso. Le sessioni restano vive.
     await store.appendAudit({

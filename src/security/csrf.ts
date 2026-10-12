@@ -44,6 +44,8 @@ export function isCsrfProtected(method: string, url: string): boolean {
     path.startsWith('/ui/') ||
     path === '/ui' ||
     path.startsWith('/account/') ||
+    path === '/admin' ||
+    path.startsWith('/admin/') ||
     path === '/account' ||
     path === '/account/logout'
   );

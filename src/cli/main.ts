@@ -9,6 +9,8 @@ import { createAccountsStore, createOidcTokenStore } from '../db/repositories.js
 import { hashPassword } from '../security/password.js';
 import { rotateKeys } from '../oidc/provider.js';
 import { listScopesForAudience } from './scope-catalog.js';
+import { AdministrationService } from '../services/administration.js';
+import { SessionManager } from '../services/session-manager.js';
 
 /**
  * CLI admin. Nessuna UI per-servizio (D2): tutto da riga di comando.
@@ -37,6 +39,10 @@ const USAGE = `engine-accounts — CLI admin
   user block <sub> [--reason <testo>]
   user unblock <sub>
   user list
+  user promote|demote <sub> --global [--force]
+  service-admin grant|revoke <sub> <service_id>
+  service add <service_id> --audience <url> [--service-name <name>]
+      [--service-description <text>] [--admin-url <url>] [--admin-api-url <url>]
 
   sessions revoke <sub> [--except-session <id>]
 
@@ -62,6 +68,13 @@ const OPTIONS = {
   name: { type: 'string' },
   password: { type: 'string' },
   verified: { type: 'boolean' },
+  global: { type: 'boolean' },
+  force: { type: 'boolean' },
+  'service-id': { type: 'string' },
+  'service-name': { type: 'string' },
+  'service-description': { type: 'string' },
+  'admin-url': { type: 'string' },
+  'admin-api-url': { type: 'string' },
   reason: { type: 'string' },
   'except-session': { type: 'string' },
   rotate: { type: 'boolean' },
@@ -98,6 +111,10 @@ export async function runCli(argv: string[]): Promise<number> {
         return await clientCommand(parsed, config, db);
       case 'user':
         return await userCommand(parsed, config, db);
+      case 'service-admin':
+        return await serviceAdminCommand(parsed, config, db);
+      case 'service':
+        return await serviceCommand(parsed, config, db);
       case 'sessions':
         return await sessionsCommand(parsed, config, db);
       case 'keys':
@@ -164,7 +181,7 @@ async function clientAdd(
     .filter(Boolean);
 
   // Gli scope richiesti devono esistere: niente scope inventati.
-  const known = new Set(['openid', 'profile', 'email', 'offline_access', ...(await listScopesForAudience(store, audience))]);
+  const known = new Set(['openid', 'profile', 'email', 'offline_access', 'engine:admin', ...(await listScopesForAudience(store, audience))]);
   const unknown = scope.filter((s) => !known.has(s));
   if (unknown.length) {
     return log(`scope non supportati: ${unknown.join(', ')} (scope disponibili: ${[...known].sort().join(', ')})`, true);
@@ -201,6 +218,19 @@ async function clientAdd(
     secretHash = await hashPassword(plainSecret, config);
   }
 
+  if (parsed.values['service-id']) {
+    await cliAdministration(db, config).upsertService('admin:cli', {
+      serviceId: String(parsed.values['service-id']), audience,
+      name: String(parsed.values['service-name'] ?? parsed.values['service-id']),
+      description: parsed.values['service-description'] ? String(parsed.values['service-description']) : undefined,
+      adminUrl: parsed.values['admin-url'] ? String(parsed.values['admin-url']) : null,
+      adminApiUrl: parsed.values['admin-api-url'] ? String(parsed.values['admin-api-url']) : null,
+    });
+  } else if (!(await store.listServices()).some((service) => service.audience === audience)) {
+    await cliAdministration(db, config).upsertService('admin:cli', {
+      serviceId: `client:${clientId}`, audience, name: String(parsed.values.name ?? clientId),
+    });
+  }
   await store.upsertClient({
     clientId,
     clientName: String(parsed.values.name ?? clientId),
@@ -239,12 +269,20 @@ async function userCommand(
 ): Promise<number> {
   const store = createAccountsStore(db);
   const tokens = createOidcTokenStore(db);
+  const administration = cliAdministration(db, config);
   const action = parsed.positionals[0];
   const sub = parsed.positionals[1];
 
   if (action === 'list') {
-    const count = await store.countUsers();
-    return log(`utenti attivi: ${count}`);
+    const result = await administration.accounts({ pageSize: 100, role: parsed.values.global ? 'global' : undefined });
+    for (const user of result.items) process.stdout.write(`${user.id} ${user.email} ${user.status}${user.isGlobalAdmin ? ' [global-admin]' : ''}\n`);
+    return log(`totale: ${result.total} (primi 100)`);
+  }
+
+  if (action === 'promote' || action === 'demote') {
+    if (!sub || parsed.values.global !== true) return log('uso: user promote|demote <sub> --global [--force]', true);
+    await administration.setGlobalRole('admin:cli', sub, action === 'promote', { force: parsed.values.force === true });
+    return log(`ruolo global ${action === 'promote' ? 'assegnato' : 'revocato'}: ${sub}`);
   }
 
   if (action === 'add') {
@@ -285,27 +323,43 @@ async function userCommand(
   const user = await store.findUserById(sub);
   if (!user) return log(`utente ${sub} non trovato`, true);
 
-  const status = action === 'block' ? 'blocked' : 'active';
   const reason = action === 'block' ? (String(parsed.values.reason ?? 'amministrazione')) : null;
-  await store.setUserStatus(sub, status, reason, 'admin:cli');
+  await administration.mutateAccount('admin:cli', sub, action, { reason: reason ?? undefined, force: parsed.values.force === true });
 
   if (action === 'block') {
     // Bloccare deve chiudere le sessioni e revocare i token: altrimenti un
     // account bloccato continua a funzionare con i token gia' emessi.
-    await store.revokeAllSessions(sub, 'admin_block');
-    const revoked = await tokens.revokeUserGrants(sub);
-    await store.appendAudit({
-      userId: sub,
-      actor: 'admin:cli',
-      event: 'user.blocked',
-      outcome: 'info',
-      metadata: { reason, tokens_revoked: revoked },
-    });
-    return log(`utente ${sub} bloccato (${revoked} token revocati, sessioni chiuse)`);
+    return log(`utente ${sub} bloccato (grant revocati, sessioni provider chiuse)`);
   }
 
   await store.updateUser(sub, { failedLogins: 0, lockedUntil: null });
   return log(`utente ${sub} sbloccato`);
+}
+
+function cliAdministration(db: Db, config: Config): AdministrationService {
+  const store = createAccountsStore(db);
+  const tokens = createOidcTokenStore(db);
+  const sessions = new SessionManager({ config, store, tokens });
+  return new AdministrationService({ db, config, store, tokens, sessions });
+}
+async function serviceAdminCommand(parsed: Parsed, config: Config, db: Db): Promise<number> {
+  const [action, sub, serviceId] = parsed.positionals;
+  if (!serviceId || !sub || !['grant', 'revoke'].includes(action ?? '')) return log('uso: service-admin grant|revoke <sub> <service_id>', true);
+  const administration = cliAdministration(db, config);
+  if (action === 'grant') await administration.grantAssignment('admin:cli', sub, serviceId);
+  else await administration.revokeAssignment('admin:cli', sub, serviceId);
+  return log(`service-admin ${action}: ${sub} / ${serviceId}`);
+}
+async function serviceCommand(parsed: Parsed, config: Config, db: Db): Promise<number> {
+  const [action, serviceId] = parsed.positionals;
+  if (action !== 'add' || !serviceId || !parsed.values.audience) return log('uso: service add <service_id> --audience <url>', true);
+  await cliAdministration(db, config).upsertService('admin:cli', {
+    serviceId, audience: String(parsed.values.audience), name: String(parsed.values['service-name'] ?? serviceId),
+    description: parsed.values['service-description'] ? String(parsed.values['service-description']) : undefined,
+    adminUrl: parsed.values['admin-url'] ? String(parsed.values['admin-url']) : null,
+    adminApiUrl: parsed.values['admin-api-url'] ? String(parsed.values['admin-api-url']) : null,
+  });
+  return log(`servizio registrato: ${serviceId}`);
 }
 
 async function sessionsCommand(parsed: Parsed, _config: Config, db: Db): Promise<number> {

@@ -16,6 +16,8 @@ export interface User {
   displayName: string | null;
   emailVerifiedAt: Date | null;
   status: UserStatus;
+  isGlobalAdmin?: boolean;
+  mustChangePassword?: boolean;
   blockedReason: string | null;
   totpEnabled: boolean;
   createdAt: Date;

@@ -23,7 +23,7 @@ import type { ClientRecord } from '../../src/domain/types.js';
  * Impalcatura per i test.
  *
  * Ogni suite parte da un database pulito ma non lo distrugge: lo schema
- * `engine_accounts` viene svuotato, il database resta. Le migration girano una
+ * `engine_accounts_test` viene svuotato, il database resta. Le migration girano una
  * volta sola (advisory lock + versioning), quindi sono veloci anche ripetute.
  */
 
@@ -52,6 +52,9 @@ export function testEnv(overrides: Record<string, string> = {}): NodeJS.ProcessE
     PUBLIC_BASE_URL: 'http://127.0.0.1:8080',
     OIDC_AUDIENCE: TEST_AUDIENCE,
     OIDC_EVENT_SIGNING_SECRET: 'test-event-signing-secret-non-production',
+    ENGINE_ACCOUNTS_COOKIE_SECRET: 'synthetic-test-cookie-secret-not-production',
+    ENGINE_ACCOUNTS_DATA_KEY: '0123456789abcdef0123456789abcdef',
+    OIDC_CLIENTS_JSON: '[]',
     MAIL_ENABLED: 'false',
     // Argon2 piu' leggero: i test fanno centinaia di hash, 64 MiB per hash
     // renderebbero la suite inutilizzabile. I parametri di produzione restano
@@ -152,6 +155,8 @@ export function registerTestClientViaCli(
 
 export async function setupHarness(options: { overrides?: Record<string, string>; mailer?: Mailer } = {}): Promise<Harness> {
   const config = testConfig(options.overrides);
+  if (config.DB_SCHEMA !== 'engine_accounts_test') throw new Error('Integration requires engine_accounts_test before migration');
+  if (config.ENGINE_ACCOUNTS_JWKS_PATH === 'var/jwks.json') throw new Error('Production JWKS forbidden in tests');
   const db = createDb(config);
   await migrate(db);
   await truncateAll(db);

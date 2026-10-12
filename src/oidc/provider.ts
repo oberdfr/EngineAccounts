@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { exportJWK, generateKeyPair, type JWK } from 'jose';
-import { errors, Provider } from 'oidc-provider';
+import { errors, interactionPolicy, Provider } from 'oidc-provider';
 import { isAllowedBackchannelUri, type Config } from '../config.js';
 import type { AccountsStore, OidcTokenStore } from '../domain/ports.js';
 import { createLogger } from '../logger.js';
@@ -17,6 +17,10 @@ import {
 import { verifyPassword } from '../security/password.js';
 import type { ArgonConfig } from '../security/argon.js';
 import { logoutSource, postLogoutSuccessSource } from './logout.js';
+import type { ServiceAuthorization } from '../services/service-authz.js';
+import { getEffectiveSettings } from '../services/administration.js';
+import type { Db } from '../db/pool.js';
+import type { User } from '../domain/types.js';
 
 const logger = createLogger((process.env.LOG_LEVEL as never) ?? 'info', { svc: 'engine-accounts' });
 
@@ -124,6 +128,8 @@ export interface BuildProviderDeps {
   store: AccountsStore;
   tokens: OidcTokenStore;
   argon: ArgonConfig;
+  authorization?: ServiceAuthorization;
+  db?: Db;
 }
 
 export async function buildProvider(deps: BuildProviderDeps): Promise<Provider> {
@@ -132,13 +138,32 @@ export async function buildProvider(deps: BuildProviderDeps): Promise<Provider> 
   const clients = await store.listClients();
   const services = await store.listServices();
   const jwks = await loadOrCreateJwks(config);
+  let currentSettings = config;
+  const policySettings = async () => {
+    currentSettings = deps.db ? { ...config, ...Object.fromEntries((await getEffectiveSettings(deps.db, config)).map((s) => [s.key, s.value])) } as Config : config;
+    return currentSettings;
+  };
+  await policySettings();
+  const eligible = async (user: User) => {
+    const settings = await policySettings();
+    return (!settings.EMAIL_VERIFICATION_REQUIRED || Boolean(user.emailVerifiedAt)) && (!settings.TOTP_REQUIRED || user.totpEnabled);
+  };
+  const policy = interactionPolicy.base();
+  policy.get('login')!.checks.add(new interactionPolicy.Check(
+    'account_policy', 'Account authentication requires attention', async (ctx) => {
+      const sub = ctx.oidc.session?.accountId;
+      if (!sub) return false;
+      const user = await store.findUserById(sub);
+      return !user || user.status !== 'active' || Boolean(user.mustChangePassword) || !await eligible(user);
+    },
+  ));
 
   const provider = new Provider(config.issuer, {
     // --- persistenza -------------------------------------------------------
     // I token passano da `OidcTokenStore` (le nostre tabelle), i client da
     // `clients`: sono dati, non codice (D2).
-    adapter: createFullAdapter({ store, tokens, config, argon }) as never,
-    findAccount: (ctx, sub) => findAccount(store, ctx, sub),
+    adapter: createFullAdapter({ store, tokens, config, argon, eligible }) as never,
+    findAccount: (ctx, sub) => findAccount(store, ctx, sub, eligible),
 
     // --- TTL (contratto 6) -------------------------------------------------
     ttl: {
@@ -149,8 +174,8 @@ export async function buildProvider(deps: BuildProviderDeps): Promise<Provider> 
       ClientCredentials: 600,
       DeviceCode: 600,
       Interaction: 3600,
-      Session: config.SESSION_TTL,
-      Grant: config.SESSION_TTL,
+      Session: () => currentSettings.SESSION_TTL,
+      Grant: () => currentSettings.SESSION_TTL,
       PushedAuthorizationRequest: 60,
       InitialAccessToken: 600,
       RegistrationAccessToken: 600,
@@ -238,7 +263,7 @@ export async function buildProvider(deps: BuildProviderDeps): Promise<Provider> 
      * compare, e non viene inventata una stringa al posto di un indirizzo
      * mancante.
      */
-    extraTokenClaims: async (_ctx, token) => accessTokenProfileClaims(store, token),
+    extraTokenClaims: async (_ctx, token) => accessTokenProfileClaims(store, token, deps.authorization),
     scopes,
     // Il contratto vuole `email`/`email_verified` anche nell'id token quando lo
     // scope c'e': la conformita' ai claim dello scope e' cio' che il proxy si
@@ -247,6 +272,7 @@ export async function buildProvider(deps: BuildProviderDeps): Promise<Provider> 
 
     // --- interazione: la UI e' nostra, stesso origin --------------------------
     interactions: {
+      policy,
       url: (ctx, interaction) => `/ui/interaction/${interaction.uid}`,
     },
     cookies: {
@@ -327,7 +353,7 @@ export async function buildProvider(deps: BuildProviderDeps): Promise<Provider> 
           const info = await resourceServerFor(
             store,
             await store.listClients(),
-            services,
+            await store.listServices(),
             resourceIndicator,
             client?.clientId,
           );

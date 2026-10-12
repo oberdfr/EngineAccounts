@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import QRCode from 'qrcode';
 import { generateTOTP, getTOTPAuthUri, verifyTOTP } from '@epic-web/totp';
 import {
   generateAuthenticationOptions,
@@ -21,6 +22,16 @@ import { decrypt, encrypt } from '../security/crypto.js';
 
 const RECOVERY_CODE_COUNT = 10;
 
+/** Local-only QR encoding: never send the enrollment secret to an external service. */
+export async function renderTotpQrSvg(uri: string): Promise<string> {
+  if (!uri.startsWith('otpauth://totp/')) throw new Error('Invalid TOTP enrollment URI');
+  return QRCode.toString(uri, { type: 'svg', errorCorrectionLevel: 'M', margin: 4, width: 256 });
+}
+
+export async function renderTotpQrDataUrl(uri: string): Promise<string> {
+  return `data:image/svg+xml;base64,${Buffer.from(await renderTotpQrSvg(uri)).toString('base64')}`;
+}
+
 /* ------------------------------ TOTP -------------------------------------- */
 
 export async function startTotpEnrolment(
@@ -28,8 +39,10 @@ export async function startTotpEnrolment(
   config: Config,
   user: Pick<User, 'id' | 'email'>,
 ): Promise<{ secret: string; uri: string }> {
-  const { secret } = await generateTOTP({ ...TOTP_DEFAULTS });
-  await store.saveTotp(user.id, encrypt(config.dataKey, secret));
+  const existing = await store.getTotp(user.id);
+  if (existing?.confirmedAt) throw new Error('TOTP is already enrolled');
+  const secret = existing ? decrypt(config.dataKey, existing.secretCt) : (await generateTOTP({ ...TOTP_DEFAULTS })).secret;
+  if (!existing) await store.saveTotp(user.id, encrypt(config.dataKey, secret));
   const uri = getTOTPAuthUri({
     ...TOTP_DEFAULTS,
     secret,
@@ -167,6 +180,7 @@ export function rpIDFromIssuer(issuer: string): string {
 export async function webauthnRegistrationOptions(
   config: Config,
   user: Pick<User, 'id' | 'email' | 'displayName'>,
+  credentials: { credentialId: string; transports: string[] }[] = [],
 ) {
   return generateRegistrationOptions({
     rpName: 'Engine Accounts',
@@ -175,10 +189,10 @@ export async function webauthnRegistrationOptions(
     userName: user.email,
     userDisplayName: user.displayName ?? user.email,
     attestationType: 'none',
-    excludeCredentials: (await Promise.resolve([])) as never,
+    excludeCredentials: credentials.map((c) => ({ id: c.credentialId, transports: c.transports })),
     authenticatorSelection: {
-      residentKey: 'preferred',
-      userVerification: 'preferred',
+      residentKey: 'required',
+      userVerification: 'required',
     },
   });
 }
@@ -208,7 +222,7 @@ export async function completeWebauthnRegistration(
       // Solo il nostro origin: una passkey vale solo sul sito che l'ha creata.
       expectedOrigin: [new URL(config.baseUrl).origin, new URL(config.issuer).origin],
       expectedRPID: rpIDFromIssuer(config.issuer),
-      requireUserVerification: false,
+      requireUserVerification: true,
     });
     if (!verification.verified || !verification.registrationInfo) {
       return { verified: false, draft: null, error: 'verifica fallita' };
@@ -244,7 +258,7 @@ export async function webauthnAuthenticationOptions(
 ) {
   return generateAuthenticationOptions({
     rpID: rpIDFromIssuer(config.issuer),
-    userVerification: 'preferred',
+    userVerification: 'required',
     // Senza elenco di credenziali si usa la passkey *discoverable*: l'utente
     // sceglie l'account sul dispositivo e non serve sapere in anticipo quale e'.
     ...(credentials.length
@@ -268,6 +282,13 @@ export async function verifyWebauthnAuthentication(
   credential: StoredCredentialForVerification,
 ): Promise<{ verified: boolean; newCounter?: number; error?: string }> {
   try {
+    const assertion = response as { id?: unknown; response?: { userHandle?: unknown } } | null;
+    if (!assertion || assertion.id !== credential.credentialId) return { verified: false, error: 'credenziale non valida' };
+    const handle = assertion.response?.userHandle;
+    if (handle != null && (typeof handle !== 'string' || !/^[A-Za-z0-9_-]+$/.test(handle)
+      || !Buffer.from(handle, 'base64url').equals(Buffer.from(user.id, 'utf8')))) {
+      return { verified: false, error: 'account non valido' };
+    }
     const verification = await verifyAuthenticationResponse({
       response: response as never,
       expectedChallenge,
@@ -279,7 +300,7 @@ export async function verifyWebauthnAuthentication(
         counter: credential.counter,
         transports: credential.transports,
       },
-      requireUserVerification: false,
+      requireUserVerification: true,
     });
     return {
       verified: verification.verified,
