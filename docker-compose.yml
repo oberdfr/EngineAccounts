@@ -1,0 +1,18 @@
+# PostgreSQL and SMTP are external; no dependency on a StreamingEngine checkout.
+name: engineaccounts
+services:
+  engine-accounts:
+    build: .
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8080
+      ENGINE_ACCOUNTS_PORT: 8080
+      ENGINE_ACCOUNTS_JWKS_PATH: /app/var/jwks.json
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-8080}:8080"
+    volumes:
+      - accounts-keys:/app/var
+    restart: unless-stopped
+volumes:
+  accounts-keys:
