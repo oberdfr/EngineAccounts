@@ -8,6 +8,7 @@ import { isAllowedBackchannelUri, type Config } from '../config.js';
 import type { AccountsStore, OidcTokenStore } from '../domain/ports.js';
 import { createLogger } from '../logger.js';
 import { createFullAdapter } from './adapter.js';
+import { nativeCorsAllowed } from './native-client.js';
 import {
   accessTokenProfileClaims,
   findAccount,
@@ -297,6 +298,10 @@ export async function buildProvider(deps: BuildProviderDeps): Promise<Provider> 
     // `'*'`: un browser non deve poter chiamare /token da qualunque pagina.
     clientBasedCORS: (ctx, origin, client) => {
       if (origin === 'null') return false;
+      if (client.applicationType === 'native') {
+        return nativeCorsAllowed(origin, { applicationType: 'native',
+          corsOrigins: (client as unknown as { cors_origins?: string[] }).cors_origins });
+      }
       if (ctx.oidc.route === 'userinfo' || client.clientAuthMethod === 'none') {
         return (client.redirectUris ?? []).some((uri) => {
           try {
@@ -317,8 +322,12 @@ export async function buildProvider(deps: BuildProviderDeps): Promise<Provider> 
     },
     // I client sono dati: `audience` e `backchannel_events_uri` sono colonne.
     extraClientMetadata: {
-      properties: ['audience', 'backchannel_events_uri', 'secret_hash'],
+      properties: ['audience', 'backchannel_events_uri', 'secret_hash', 'cors_origins'],
       validator(_ctx, key, value) {
+        if (key === 'cors_origins' && value !== undefined &&
+          (!Array.isArray(value) || !value.every((entry) => typeof entry === 'string'))) {
+          throw new TypeError('cors_origins must be an explicit string array');
+        }
         if (key === 'audience' && value !== undefined && typeof value !== 'string') {
           throw new TypeError('client audience deve essere una stringa');
         }

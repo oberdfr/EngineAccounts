@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { validateClientApplication } from '../oidc/native-client.js';
 import type { PoolClient } from 'pg';
 import { table, type Db } from './pool.js';
 import type { AccountsStore, OidcEntry, OidcModelKind, OidcTokenStore } from '../domain/ports.js';
@@ -96,6 +97,8 @@ const toSession = (r: SessionRow): SessionRecord => ({
 });
 
 interface ClientRow {
+  application_type: 'web' | 'native';
+  cors_origins: string[];
   client_id: string;
   client_name: string;
   client_type: 'public' | 'confidential';
@@ -114,6 +117,8 @@ interface ClientRow {
 }
 
 const toClient = (r: ClientRow): ClientRecord => ({
+  applicationType: r.application_type ?? 'web',
+  corsOrigins: r.cors_origins ?? [],
   clientId: r.client_id,
   clientName: r.client_name,
   clientType: r.client_type,
@@ -192,7 +197,7 @@ const SESSION_COLS = `id, user_id, token_digest, provider_session_id, provider_s
   ip, user_agent, amr, created_at, last_seen_at, expires_at, revoked_at, revoke_reason`;
 const CLIENT_COLS = `client_id, client_name, client_type, client_secret_hash, redirect_uris,
   post_logout_redirect_uris, grant_types, response_types, scope, audience,
-  backchannel_events_uri, token_endpoint_auth_method, enabled, created_at, updated_at`;
+  backchannel_events_uri, token_endpoint_auth_method, enabled, created_at, updated_at, application_type, cors_origins`;
 const CONSENT_COLS = `id, user_id, client_id, scope, granted_at, expires_at, revoked_at`;
 const WEBAUTHN_COLS = `id, user_id, credential_id, public_key, counter, transports, aaguid,
   device_type, backed_up, nickname, created_at, last_used_at`;
@@ -464,11 +469,12 @@ export function createAccountsStore(db: Db): AccountsStore {
       return rows.map(toClient);
     },
     async upsertClient(input) {
+      validateClientApplication(input);
       const rows = await db.query<ClientRow>(
         `INSERT INTO ${clients()}
            (client_id, client_name, client_type, client_secret_hash, redirect_uris, post_logout_redirect_uris,
-            grant_types, response_types, scope, audience, backchannel_events_uri, token_endpoint_auth_method, enabled)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            grant_types, response_types, scope, audience, backchannel_events_uri, token_endpoint_auth_method, enabled, application_type, cors_origins)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
          ON CONFLICT (client_id) DO UPDATE SET
            client_name = EXCLUDED.client_name,
            client_type = EXCLUDED.client_type,
@@ -482,6 +488,8 @@ export function createAccountsStore(db: Db): AccountsStore {
            backchannel_events_uri = EXCLUDED.backchannel_events_uri,
            token_endpoint_auth_method = EXCLUDED.token_endpoint_auth_method,
            enabled = EXCLUDED.enabled,
+           application_type = EXCLUDED.application_type,
+           cors_origins = EXCLUDED.cors_origins,
            updated_at = now()
          RETURNING ${CLIENT_COLS}`,
         [
@@ -498,6 +506,8 @@ export function createAccountsStore(db: Db): AccountsStore {
           input.backchannelEventsUri,
           input.tokenEndpointAuthMethod,
           input.enabled,
+          input.applicationType ?? 'web',
+          input.corsOrigins ?? [],
         ],
       );
       return toClient(rows[0]!);

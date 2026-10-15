@@ -38,7 +38,8 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 /** Origine (`scheme://host[:port]`) di una URL, oppure `null` se non e' URL. */
 export function originOf(url: string): string | null {
   try {
-    return new URL(url).origin;
+    const parsed = new URL(url);
+    return ['http:', 'https:'].includes(parsed.protocol) && parsed.origin !== 'null' ? parsed.origin : null;
   } catch {
     return null;
   }
@@ -53,16 +54,36 @@ export function originOf(url: string): string | null {
  * corrotti) vengono scartati invece di far fallire l'avvio: una allowlist
  * incompleta blocca il login, una allowlist che non parte blocca tutto.
  */
-export function redirectOriginsOf(clients: readonly { redirectUris: readonly string[]; enabled: boolean }[]): string[] {
+export function redirectOriginsOf(clients: readonly { redirectUris: readonly string[]; enabled: boolean; applicationType?: string; corsOrigins?: readonly string[] }[]): string[] {
   const origins = new Set<string>();
   for (const client of clients) {
     if (!client.enabled) continue;
+    if (client.applicationType === 'native') {
+      for (const origin of client.corsOrigins ?? []) {
+        try { if (!origin.includes('*') && new URL(origin).protocol === 'https:' && new URL(origin).origin === origin) origins.add(origin); }
+        catch { /* Invalid native origins never widen the allowlist. */ }
+      }
+    }
     for (const uri of client.redirectUris) {
       const origin = originOf(uri);
       if (origin) origins.add(origin);
     }
   }
   return [...origins].sort();
+}
+
+export function redirectFormActionsOf(clients: readonly { redirectUris: readonly string[]; enabled: boolean; applicationType?: string; corsOrigins?: readonly string[] }[]): string[] {
+  const sources = new Set(redirectOriginsOf(clients));
+  for (const client of clients) {
+    if (!client.enabled || client.applicationType !== 'native') continue;
+    for (const uri of client.redirectUris) {
+      try {
+        const protocol = new URL(uri).protocol;
+        if (protocol === 'streamingengine:' || /^[a-z][a-z0-9+.-]*\.[a-z0-9+.-]+:$/.test(protocol)) sources.add(protocol);
+      } catch { /* Fail closed for malformed persisted metadata. */ }
+    }
+  }
+  return [...sources].sort();
 }
 
 /**

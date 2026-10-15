@@ -4,6 +4,7 @@ import type { AccountsStore, OidcEntry, OidcTokenStore } from '../domain/ports.j
 import type { ClientRecord, User } from '../domain/types.js';
 import { verifyPassword } from '../security/password.js';
 import type { ArgonConfig } from '../security/argon.js';
+import { validateClientApplication } from './native-client.js';
 
 /**
  * Adapter di persistenza per oidc-provider.
@@ -213,6 +214,7 @@ async function verifyClientSecretFor(plain: string, argon: ArgonConfig): Promise
  * in chiaro attraversa il processo oltre il momento in cui la CLI lo genera.
  */
 export function toClientMetadata(client: ClientRecord, _config: Config): Record<string, unknown> {
+  validateClientApplication(client);
   return {
     client_id: client.clientId,
     client_name: client.clientName,
@@ -223,7 +225,8 @@ export function toClientMetadata(client: ClientRecord, _config: Config): Record<
     grant_types: client.grantTypes,
     response_types: client.responseTypes,
     scope: client.scope.join(' '),
-    application_type: 'web',
+    application_type: client.applicationType ?? 'web',
+    cors_origins: client.corsOrigins ?? [],
     // Metadata nostri: audience (RFC 8707), backchannel event (C11), hash del secret.
     audience: client.audience,
     ...(client.backchannelEventsUri ? { backchannel_events_uri: client.backchannelEventsUri } : {}),

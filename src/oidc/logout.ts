@@ -10,15 +10,17 @@ function allowLogoutRedirect(ctx: KoaContextWithOIDC): void {
   const client = ctx.oidc.client;
   if (typeof uri !== 'string' || !client?.postLogoutRedirectUriAllowed(uri)) return;
   const target = new URL(uri);
-  if (target.protocol !== 'http:' && target.protocol !== 'https:') return;
+  const web = target.protocol === 'http:' || target.protocol === 'https:';
+  if (!web && client.applicationType !== 'native') return;
+  const source = web ? target.origin : target.protocol;
   const policy = ctx.response.get('Content-Security-Policy') || CSP;
   let replaced = false;
   const directives = policy.split(';').map((directive) => {
     if (!/^\s*form-action(?:\s|$)/.test(directive)) return directive;
     replaced = true;
-    return ` form-action 'self' ${target.origin}`;
+    return ` form-action 'self' ${source}`;
   });
-  if (!replaced) directives.push(` form-action 'self' ${target.origin}`);
+  if (!replaced) directives.push(` form-action 'self' ${source}`);
   ctx.set('Content-Security-Policy', directives.join(';').trim());
 }
 

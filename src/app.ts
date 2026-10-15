@@ -10,7 +10,7 @@ import { Provider } from 'oidc-provider';
 import type { Config } from './config.js';
 import type { Db } from './db/pool.js';
 import { createAccountsStore, createOidcTokenStore } from './db/repositories.js';
-import { applySecurityHeaders, flushReplyHeadersToRaw, redirectOriginsOf } from './security/headers.js';
+import { applySecurityHeaders, flushReplyHeadersToRaw, redirectOriginsOf, redirectFormActionsOf } from './security/headers.js';
 import { csrfCookieName, isCsrfProtected, CSRF_FIELD } from './security/csrf.js';
 import { activePublicJwks, buildProvider } from './oidc/provider.js';
 import { registerUserinfoRoute } from './oidc/userinfo.js';
@@ -244,7 +244,7 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
     applySecurityHeaders(request, reply, {
       isPage,
       hsts: config.hsts,
-      formActionOrigins: path.startsWith('/ui/interaction/') ? await clientOrigins() : [],
+      formActionOrigins: path.startsWith('/ui/interaction/') ? redirectFormActionsOf(await store.listClients()) : [],
     });
     if (request.method !== 'GET' && request.method !== 'HEAD' && !isOIDCPath(path)) {
       reply.header('Cache-Control', 'no-store');

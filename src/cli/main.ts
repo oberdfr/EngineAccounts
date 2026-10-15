@@ -11,6 +11,7 @@ import { rotateKeys } from '../oidc/provider.js';
 import { listScopesForAudience } from './scope-catalog.js';
 import { AdministrationService } from '../services/administration.js';
 import { SessionManager } from '../services/session-manager.js';
+import { validateClientApplication } from '../oidc/native-client.js';
 
 /**
  * CLI admin. Nessuna UI per-servizio (D2): tutto da riga di comando.
@@ -31,6 +32,7 @@ const USAGE = `engine-accounts — CLI admin
   client add <client_id> --type public|confidential --redirect-uri <uri>
       [--post-logout-uri <uri>] [--scope a,b,c] --audience <url>
       [--backchannel-events-uri <url>] [--name <nome>] [--rotate]
+      [--application-type web|native] [--cors-origin https://localhost]
   client list
   client remove <client_id>
 
@@ -60,6 +62,8 @@ interface Parsed {
 
 const OPTIONS = {
   type: { type: 'string' },
+  'application-type': { type: 'string' },
+  'cors-origin': { type: 'string', multiple: true },
   'redirect-uri': { type: 'string', multiple: true },
   'post-logout-uri': { type: 'string', multiple: true },
   scope: { type: 'string' },
@@ -174,6 +178,10 @@ async function clientAdd(
   const redirectUris = toArray(parsed.values['redirect-uri']);
   if (!redirectUris.length) return log('manca almeno --redirect-uri (match esatto obbligatorio)', true);
   const postLogout = toArray(parsed.values['post-logout-uri']);
+  const applicationType = String(parsed.values['application-type'] ?? 'web') as 'web' | 'native';
+  const corsOrigins = toArray(parsed.values['cors-origin']);
+  try { validateClientApplication({ applicationType, corsOrigins, clientType: type, redirectUris, postLogoutRedirectUris: postLogout }); }
+  catch (error) { return log(error instanceof Error ? error.message : 'Invalid native policy', true); }
   const audience = String(parsed.values.audience ?? config.OIDC_AUDIENCE);
   const scope = String(parsed.values.scope ?? 'openid profile email offline_access')
     .split(',')
@@ -232,6 +240,8 @@ async function clientAdd(
     });
   }
   await store.upsertClient({
+    applicationType,
+    corsOrigins,
     clientId,
     clientName: String(parsed.values.name ?? clientId),
     clientType: type,
@@ -250,6 +260,8 @@ async function clientAdd(
 
   process.stdout.write(`client registrato: ${clientId}\n`);
   process.stdout.write(`  tipo            ${type}\n`);
+  process.stdout.write(`  applicazione    ${applicationType}\n`);
+  if (corsOrigins.length) process.stdout.write(`  origini CORS    ${corsOrigins.join(', ')}\n`);
   process.stdout.write(`  audience        ${audience}\n`);
   process.stdout.write(`  scope           ${scope.join(' ')}\n`);
   process.stdout.write(`  redirect_uri    ${redirectUris.join('\n                   ')}\n`);

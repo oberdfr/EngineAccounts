@@ -62,6 +62,8 @@ export interface SessionRecord {
 export type ClientType = 'public' | 'confidential';
 
 export interface ClientRecord {
+  applicationType?: 'web' | 'native';
+  corsOrigins?: string[];
   clientId: string;
   clientName: string;
   clientType: ClientType;

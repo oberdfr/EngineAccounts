@@ -4,6 +4,10 @@ EngineAccounts non importa sorgenti, dati o unit dei consumer. Registrare client
 pubblici tramite OIDC_CLIENTS_JSON nel `.env`, client confidenziali tramite CLI.
 OIDC_CLIENTS_JSON=[] avvia il provider senza alcuna applicazione collegata.
 
+Per app Android con browser di sistema e WebView, usare la registrazione CLI
+esplicita descritta in [Client nativi](native-clients.md): tipo nativo, PKCE,
+scheme applicativo e allowlist CORS per-client, senza modificare i client web.
+
 Estensioni additive 1.1.0: [richieste per i consumer](consumer-admin.md),
 ruolo per audience nell'access token, verifica authz server-side, SSO verso
 adminUrl e purge firmato verso adminApiUrl. Nessun setting del consumer viene
