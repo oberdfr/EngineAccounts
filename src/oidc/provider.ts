@@ -7,8 +7,10 @@ import { errors, interactionPolicy, Provider } from 'oidc-provider';
 import { isAllowedBackchannelUri, type Config } from '../config.js';
 import type { AccountsStore, OidcTokenStore } from '../domain/ports.js';
 import { createLogger } from '../logger.js';
-import { createFullAdapter } from './adapter.js';
-import { nativeCorsAllowed } from './native-client.js';
+import { createFullAdapter, wrapRefreshTokenGrant } from './adapter.js';
+import { isDeviceClient, nativeCorsAllowed } from './native-client.js';
+import { deviceRateLimitedPage, deviceSuccessPage, userCodeConfirmPage, userCodeInputPage } from './device-pages.js';
+import type { RateLimiter } from '../security/rate-limit.js';
 import {
   accessTokenProfileClaims,
   findAccount,
@@ -131,6 +133,8 @@ export interface BuildProviderDeps {
   argon: ArgonConfig;
   authorization?: ServiceAuthorization;
   db?: Db;
+  /** Anti brute-force sull'inserimento dei codici device (POST /device). */
+  limiter?: RateLimiter;
 }
 
 export async function buildProvider(deps: BuildProviderDeps): Promise<Provider> {
@@ -159,14 +163,22 @@ export async function buildProvider(deps: BuildProviderDeps): Promise<Provider> 
     },
   ));
 
-  const provider = new Provider(config.issuer, {
+  // Dichiarato prima: la grace lo ragguaglia a fine costruzione
+  // (`wrapRefreshTokenGrant`) e gli helper lo ricevono.
+  let provider: Provider;
+  provider = new Provider(config.issuer, {
     // --- persistenza -------------------------------------------------------
     // I token passano da `OidcTokenStore` (le nostre tabelle), i client da
     // `clients`: sono dati, non codice (D2).
     adapter: createFullAdapter({ store, tokens, config, argon, eligible }) as never,
     findAccount: (ctx, sub) => findAccount(store, ctx, sub, eligible),
 
-    // --- TTL (contratto 6) -------------------------------------------------
+    // --- TTL ---------------------------------------------------------------
+    // Access e id token: 15 minuti (una revoca ha effetto in fretta).
+    // Refresh token e sessione/grant: 90 giorni, **scorrevoli** (ogni rinnovo
+    // riparte da capo, vedere `slidingRefreshTokenTtl` e
+    // `slideSessionSynced`). Il logout esplicito invalida comunque tutto.
+
     ttl: {
       AccessToken: config.ACCESS_TOKEN_TTL,
       AuthorizationCode: 60,
@@ -175,6 +187,11 @@ export async function buildProvider(deps: BuildProviderDeps): Promise<Provider> 
       ClientCredentials: 600,
       DeviceCode: 600,
       Interaction: 3600,
+      /*
+       * Sessione e grant vivono quanto SESSION_TTL **scorrevole**
+       * (`slideSessionExpiry`): il valore e' anche l'orizzonte a cui la
+       * sessione viene riportata a ogni scrittura, non una gabbia dal login.
+       */
       Session: () => currentSettings.SESSION_TTL,
       Grant: () => currentSettings.SESSION_TTL,
       PushedAuthorizationRequest: 60,
@@ -182,7 +199,8 @@ export async function buildProvider(deps: BuildProviderDeps): Promise<Provider> 
       RegistrationAccessToken: 600,
     },
     // Rotazione a ogni uso + rilevamento del riuso: un refresh token gia'
-    // consumato revoca l'intera famiglia (contratto 6).
+    // consumato **oltre la grace window** revoca l'intera famiglia
+    // (`wrapRefreshTokenGrant`). Entro 30 s il riuso e' idempotente.
     rotateRefreshToken: true,
 
     // --- path degli endpoint: quelli del CONTRATTO -------------------------
@@ -297,11 +315,14 @@ export async function buildProvider(deps: BuildProviderDeps): Promise<Provider> 
     // se combacia con uno dei `redirect_uris` registrati del client. Non e'
     // `'*'`: un browser non deve poter chiamare /token da qualunque pagina.
     clientBasedCORS: (ctx, origin, client) => {
-      if (origin === 'null') return false;
       if (client.applicationType === 'native') {
+        // `null` (webOS file://) passa solo per un client device-flow che lo
+        // dichiara esplicitamente in cors_origins; mai per gli altri.
         return nativeCorsAllowed(origin, { applicationType: 'native',
-          corsOrigins: (client as unknown as { cors_origins?: string[] }).cors_origins });
+          corsOrigins: (client as unknown as { cors_origins?: string[] }).cors_origins,
+          grantTypes: client.grantTypes });
       }
+      if (origin === 'null') return false;
       if (ctx.oidc.route === 'userinfo' || client.clientAuthMethod === 'none') {
         return (client.redirectUris ?? []).some((uri) => {
           try {
@@ -377,7 +398,17 @@ export async function buildProvider(deps: BuildProviderDeps): Promise<Provider> 
       revocation: { enabled: true },
       registration: { enabled: false },
       clientCredentials: { enabled: false },
-      deviceFlow: { enabled: false },
+      deviceFlow: {
+        enabled: config.OIDC_DEVICE_FLOW_ENABLED,
+        // Codice leggibile: 8 consonanti senza ambigui (niente vocali, 0/O, 1/I),
+        // mostrato come ABCD-EFGH. 20^8 combinazioni, validi 10 minuti.
+        charset: 'base-20',
+        mask: '****-****',
+        userCodeInputSource: async (ctx, _form, _out, err) => userCodeInputPage(ctx as never, err as never),
+        userCodeConfirmSource: async (ctx, _form, client, _deviceInfo, userCode) =>
+          userCodeConfirmPage(ctx as never, String(userCode), String(client.clientName || client.clientId)),
+        successSource: async (ctx) => deviceSuccessPage(ctx as never),
+      },
       ciba: { enabled: false },
       pushedAuthorizationRequests: { enabled: false },
       webMessageResponseMode: { enabled: false },
@@ -401,8 +432,26 @@ export async function buildProvider(deps: BuildProviderDeps): Promise<Provider> 
     },
   });
 
+  /*
+   * Grace window della rotazione: si aggancia **all'handler di
+   * `grant_type=refresh_token`** gia' installato dalla libreria, non a un
+   * middleware Koa. E' l'unico punto in cui `ctx.oidc.params` esiste: un
+   * `use()` arriverebbe prima che la libreria legga il body, e un middleware
+   * in configurazione nemmeno vedrebbe `ctx.oidc`.
+   */
+  await wrapRefreshTokenGrant(provider);
+  /*
+   * Sessione scorrevole: ogni scrittura del modello `Session` riporta `exp`
+   * avanti di SESSION_TTL (letto a caldo, cosi' un cambio dall'admin vale
+   * subito). Stesso orizzonte per il `Grant`.
+   */
+  for (const adapter of [provider.Session?.adapter, provider.Grant?.adapter]) {
+    (adapter as { slide?: (ttl: () => number) => void } | undefined)?.slide?.(() => currentSettings.SESSION_TTL);
+  }
+
   patchClientSecretComparison(provider, argon);
   applyProxyTrust(provider, config);
+  if (config.OIDC_DEVICE_FLOW_ENABLED) applyDeviceFlowMiddleware(provider, deps.limiter);
 
   logger.info('provider OIDC costruito', {
     issuer: config.issuer,
@@ -495,4 +544,43 @@ function errorPage(error: string, description: string | undefined): string {
 <p class="lede">Errore: <code>${esc(error)}</code></p>
 ${description ? `<p>${esc(description)}</p>` : ''}
 <p><a href="/ui/login">Torna all'accesso</a></p></main></body></html>`;
+}
+
+/** Tentativi di inserimento codice per IP: 12 ogni 5 minuti (20^8 codici, scadenza 10 min). */
+const DEVICE_CODE_ATTEMPTS = 12;
+const DEVICE_CODE_WINDOW_MS = 300_000;
+/** Intervallo di polling suggerito (RFC 8628 §3.2): 5 secondi. */
+const DEVICE_POLL_INTERVAL = 5;
+
+/**
+ * Rifiniture del device flow che la libreria non espone come opzioni:
+ *  - `interval` nella risposta di `/device/auth` (la libreria applica 5 s e
+ *    risponde `slow_down`, ma non lo annuncia);
+ *  - rate limit sui POST di inserimento/conferma codice (anti brute force);
+ *  - `verification_uri_complete` apre un form che la libreria invia da solo
+ *    con uno script inline, vietato dalla nostra CSP: lo sostituiamo con la
+ *    pagina di inserimento gia' compilata.
+ */
+function applyDeviceFlowMiddleware(provider: Provider, limiter: RateLimiter | undefined): void {
+  provider.use(async (ctx, next) => {
+    if (limiter && ctx.method === 'POST' && ctx.path === '/device') {
+      const verdict = limiter.checkIp(`device-code:${ctx.ip}`, DEVICE_CODE_ATTEMPTS, DEVICE_CODE_WINDOW_MS);
+      if (!verdict.allowed) {
+        ctx.status = 429;
+        ctx.set('Retry-After', String(verdict.retryAfterSeconds));
+        const accepts = ctx.accepts('json', 'html');
+        if (accepts === 'json') ctx.body = { error: 'slow_down', error_description: 'too many attempts' };
+        else deviceRateLimitedPage(ctx as never);
+        return;
+      }
+    }
+    await next();
+    const oidc = (ctx as unknown as { oidc?: { route?: string; params?: { user_code?: string } } }).oidc;
+    if (oidc?.route === 'device_authorization' && ctx.status === 200 && ctx.body && typeof ctx.body === 'object') {
+      (ctx.body as Record<string, unknown>).interval ??= DEVICE_POLL_INTERVAL;
+    }
+    if (oidc?.route === 'code_verification' && ctx.method === 'GET' && typeof oidc.params?.user_code === 'string') {
+      userCodeInputPage(ctx as never, undefined, oidc.params.user_code);
+    }
+  });
 }

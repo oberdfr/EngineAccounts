@@ -339,8 +339,15 @@ export function createAccountsStore(db: Db): AccountsStore {
       ]);
       return r ? toSession(r) : undefined;
     },
-    async touchSession(id) {
-      await db.query(`UPDATE ${sessions()} SET last_seen_at = now() WHERE id = $1 AND revoked_at IS NULL`, [id]);
+    async touchSession(id, expiresAt) {
+      // Scorrevole: `last_seen_at` avanza e, se indicato, anche la scadenza
+      // (mai oltre il tetto deciso dal chiamante).
+      await db.query(
+        expiresAt
+          ? `UPDATE ${sessions()} SET last_seen_at = now(), expires_at = GREATEST(expires_at, $2) WHERE id = $1 AND revoked_at IS NULL`
+          : `UPDATE ${sessions()} SET last_seen_at = now() WHERE id = $1 AND revoked_at IS NULL`,
+        expiresAt ? [id, expiresAt] : [id],
+      );
     },
     async linkProviderSession(id, providerSessionId, providerSessionUid) {
       await db.query(
@@ -991,17 +998,95 @@ export function createOidcTokenStore(db: Db): OidcTokenStore {
 
     async consume(kind, id) {
       const consumed = Math.floor(Date.now() / 1000);
-      const payload = await this.find(kind, id);
-      if (!payload) return;
-      const next = { ...payload, consumed };
-      // `consumed` sta nel payload: la libreria lo riliede al momento del find.
-      await this.upsert(kind, id, next);
-      if (kind === 'codes' || kind === 'tokens') {
-        const column = kind === 'codes' ? T.codes : T.tokens;
-        await db.query(`UPDATE ${column} SET consumed_at = now() WHERE id = $1`, [id]);
-      } else if (kind === 'interactions') {
-        await db.query(`UPDATE ${T.interactions} SET consumed_at = now() WHERE id = $1`, [id]);
-      }
+      /*
+       * **Atomico**, e su una sola riga: il flag `consumed` che la libreria
+       * rilegge sta nel payload JSON, ma prima si leggeva, si riscriveva con
+       * `upsert` (che azzera anche `revoked_at` e ricalcola `expires_at`) e poi
+       * si timbrava `consumed_at`: fra lettura e scrittura due richieste
+       * potevano perdere il flag, e una riga revocata tornava viva.
+       *
+       * Qui e' un solo `UPDATE ... WHERE consumed_at IS NULL RETURNING`: chi
+       * arriva secondo non tocca niente, e il flag non si puo' perdere.
+       *
+       * Sul **refresh token** si annota anche l'istante di consumo in
+       * `rotation.consumedAtMs` (millisecondi, dall'orologio del processo:
+       * serve la precisione per una finestra di 30 s): e' la base della grace
+       * window (`findSuperseded`). Il successore lo collega l'adapter.
+       */
+      const now = Date.now();
+      /*
+       * Ogni ramo deve usare **tutti** i parametri passati (Postgres rifiuta un
+       * bind con un segnaposto in meno): quelli che non servono restano in una
+       * sottoquery costante.
+       */
+      const sql = {
+        codes: `UPDATE ${T.codes}
+                  SET consumed_at = now(),
+                      payload = payload || jsonb_build_object(
+                        'consumed', $2::bigint,
+                        'consumedMs', (SELECT $3::bigint))
+                WHERE id = $1 AND consumed_at IS NULL AND revoked_at IS NULL
+                RETURNING payload`,
+        tokens: `UPDATE ${T.tokens}
+                  SET consumed_at = now(),
+                      payload = payload || jsonb_build_object('consumed', $2::bigint),
+                      rotation = rotation || jsonb_build_object('consumedAtMs', $3::bigint)
+                WHERE id = $1 AND consumed_at IS NULL AND revoked_at IS NULL
+                RETURNING payload`,
+        interactions: `UPDATE ${T.interactions}
+                  SET consumed_at = now(),
+                      payload = payload || jsonb_build_object(
+                        'consumed', $2::bigint,
+                        'consumedMs', (SELECT $3::bigint))
+                WHERE id = $1 AND consumed_at IS NULL
+                RETURNING payload`,
+        grants: `SELECT payload FROM ${T.grants} WHERE grant_id = $1 AND $2::bigint IS NOT NULL AND $3::bigint IS NOT NULL`,
+        sessions: `SELECT payload FROM ${T.sessions} WHERE id = $1 AND $2::bigint IS NOT NULL AND $3::bigint IS NOT NULL`,
+        replay: `SELECT payload FROM ${T.replay} WHERE jti = $1 AND $2::bigint IS NOT NULL AND $3::bigint IS NOT NULL`,
+      }[kind];
+      const rows = await db.query<{ payload: OidcEntry }>(sql, [id, consumed, now]);
+      void rows;
+    },
+
+    async setSuccessor(kind, id, successor) {
+      if (typeof successor !== 'string' || !successor) return;
+      // Prima volta vince: un token ha un solo successore. Il successore e' il
+      // jti del token emesso dopo di lui, che e' anche il valore presentato dal
+      // client (formato opaco di `oidc-provider`): e' un puntatore, non un segreto.
+      await db.query(
+        `UPDATE ${T.tokens}
+         SET payload = jsonb_set(payload, '{supersededBy}', to_jsonb($2::text)),
+             rotation = rotation || jsonb_build_object('successor', $2::text)
+         WHERE id = $1 AND payload->>'supersededBy' IS NULL`,
+        [id, successor],
+      );
+    },
+
+    async findSuperseded(id) {
+      const r = await db.one<{
+        payload: OidcEntry;
+        grant_id: string | null;
+        consumed_at: Date | null;
+        revoked_at: Date | null;
+        rotation: { consumedAtMs?: number; successor?: string } | null;
+      }>(
+        `SELECT t.payload, t.grant_id, t.consumed_at, t.rotation, t.revoked_at
+         FROM ${T.tokens} t
+         WHERE t.id = $1`,
+        [id],
+      );
+      if (!r) return undefined;
+      const successorId = typeof r.rotation?.successor === 'string'
+        ? r.rotation.successor
+        : typeof r.payload.supersededBy === 'string' ? r.payload.supersededBy : null;
+      return {
+        payload: r.payload,
+        grantId: r.grant_id,
+        consumedAt: r.consumed_at,
+        consumedAtMs: typeof r.rotation?.consumedAtMs === 'number' ? r.rotation.consumedAtMs : null,
+        revokedAt: r.revoked_at,
+        successorId,
+      };
     },
 
     async destroy(kind, id) {

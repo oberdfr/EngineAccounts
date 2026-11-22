@@ -134,20 +134,31 @@ export class SessionManager {
     return { record, cookieValue: token, maxAgeSeconds: ttl };
   }
 
-  /** Sessione attiva per questo token, con `last_seen` aggiornato. */
+  /**
+   * Sessione attiva per questo token.
+   *
+   * **Scorrevole**: `expiresAt` viene riportato avanti a ogni uso (entro il
+   * tetto del TTL corrente), invece di restare la data fiss ata alla creazione.
+   * Prima la sessione moriva `SESSION_TTL` dopo il *login* anche con attivita'
+   * continua; ora muore `SESSION_TTL` dopo l'**ultimo uso** — e il logout
+   * esplicito (`revoke`) la uccide subito, come sempre.
+   */
   async resolve(cookieValue: string | undefined): Promise<{ user: User; session: SessionRecord } | undefined> {
     if (!cookieValue) return undefined;
     const record = await this.deps.store.findSessionByTokenDigest(this.digest(cookieValue));
     if (!record) return undefined;
-    if (record.revokedAt || record.expiresAt.getTime() <= Date.now()) return undefined;
-    if (this.deps.db) {
-      const ttl = Number(await effectiveSetting(this.deps.db, this.deps.config, 'SESSION_TTL'));
-      if (record.createdAt.getTime() + ttl * 1000 <= Date.now()) return undefined;
-    }
+    const now = Date.now();
+    if (record.revokedAt || record.expiresAt.getTime() <= now) return undefined;
+    const ttl = this.deps.db
+      ? Number(await effectiveSetting(this.deps.db, this.deps.config, 'SESSION_TTL'))
+      : this.deps.config.SESSION_TTL;
     const user = await this.deps.store.findUserById(record.userId);
     if (!user || user.status !== 'active') return undefined;
-    await this.deps.store.touchSession(record.id);
-    return { user, session: { ...record, lastSeenAt: new Date() } };
+    const expiresAt = new Date(
+      Math.min(now + ttl * 1000, record.createdAt.getTime() + ttl * 1000),
+    );
+    await this.deps.store.touchSession(record.id, expiresAt);
+    return { user, session: { ...record, lastSeenAt: new Date(now), expiresAt } };
   }
 
   /**

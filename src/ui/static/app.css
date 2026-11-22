@@ -356,3 +356,7 @@ dialog button { margin:8px 8px 0 0; }
   .card,.panel,.filters,.auth-panel,.split>.stack,.action-card { background:var(--glass-fill); backdrop-filter:var(--glass-blur); }
   .identity-dropdown,.mobile-nav>.nav { background:var(--glass-raised); backdrop-filter:var(--glass-blur); }
 }
+
+/* Device flow (RFC 8628): codice di conferma ben leggibile. */
+.device-code { margin:12px 0 20px; text-align:center; }
+.device-code code { font-size:clamp(28px,8vw,40px); font-weight:600; letter-spacing:.12em; overflow-wrap:normal; }

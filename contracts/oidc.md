@@ -106,9 +106,11 @@ Access token e ID token portano:
   (confusione HS/RS rifiutata a livello di libreria).
 - Firma verificata con la JWKS **cacheata** e rinfrescata su chiave sconosciuta, con
   coalescing delle richieste (D1: nessuna chiamata al provider per ogni richiesta).
-- TTL access token: **15 minuti**. Refresh token: **30 giorni**, con **rotazione a ogni uso**.
-- **Rilevamento del riuso**: un refresh token già usato revoca **l'intera famiglia**.
-  I client che ruotano devono gestire il `401` e rifare la sequenza di autorizzazione.
+- TTL access token: **15 minuti**. Refresh token: **90 giorni scorrevoli**, con **rotazione a ogni uso**
+  (dettaglio: `docs/security/session-lifetime.md`).
+- **Rilevamento del riuso**: un refresh token già usato **oltre 30 secondi** dalla rotazione
+  revoca **l'intera famiglia**; entro 30 secondi la risposta è **idempotente** (stesso refresh
+  token successore), per schede multiple e retry di rete.
 - Chiavi con rotazione: le chiavi vecchie restano pubblicate in JWKS finché non scadono i
   token che hanno firmato. `kid` obbligatorio.
 
@@ -270,3 +272,45 @@ sub in quel servizio, non l'identità Accounts né i ruoli negli altri servizi.
 Non confondere l'evento con cancellazione identità o revoca del consenso.
 
 Lato consumer fuori scope: [richieste esatte](../docs/integration/consumer-admin.md).
+
+## 13. Device Authorization Grant — client TV (RFC 8628)
+
+Abilitato da `OIDC_DEVICE_FLOW_ENABLED=true` (default `false`: con il flag spento `/device/auth` e `/device`
+non esistono e la discovery non annuncia il grant). Serve alle TV senza tastiera/browser: la TV mostra
+un codice, l'utente lo conferma da un telefono/PC.
+
+**Client**: `streamingengine-tv` ("TV StreamingEngine"), pubblico (`token_endpoint_auth_method=none`, nessun
+secret), `application_type=native`, `grant_types = urn:ietf:params:oauth:grant-type:device_code, refresh_token`,
+nessun `redirect_uri` (niente Authorization Code). Scope: `openid profile email offline_access
+streaming:catalog streaming:playback streaming:account` (come `streamingengine-android`); audience
+`https://api.engine.local/streaming`. Si dichiara in `OIDC_CLIENTS_JSON` con `grantTypes`, `applicationType`,
+`corsOrigins` (e senza `redirectUris`). CORS per-client: solo `https://appassets.androidplatform.net` e il
+literal `null` (webOS `file://`); `null` è ammesso **solo** per client device-flow che lo dichiarano
+esplicitamente, mai per gli altri.
+
+| Endpoint | Path | Note |
+|---|---|---|
+| device_authorization_endpoint | `POST /device/auth` | `client_id`, `scope` (form-urlencoded) |
+| verification_uri | `GET /device` | pagina italiana per l'utente; `?user_code=` precompila il codice |
+| token_endpoint | `POST /token` | `grant_type=urn:ietf:params:oauth:grant-type:device_code`, `device_code`, `client_id` |
+
+Issuer: `https://engine.oberdfr.top` (valore di `OIDC_ISSUER`).
+
+**Risposta di `/device/auth`**: `device_code`, `user_code` (formato `ABCD-EFGH`, 8 consonanti
+`BCDFGHJKLMNPQRSTVWXZ`, niente caratteri ambigui), `verification_uri`, `verification_uri_complete`,
+`expires_in` = **600**, `interval` = **5**.
+
+**Polling**: ogni `interval` secondi `POST /token`. Risposte `400` con `error`:
+`authorization_pending` (continua), `slow_down` (aumenta l'intervallo di 5 s), `access_denied` (l'utente ha
+annullato o rifiutato), `expired_token` (codice scaduto: ripartire da `/device/auth`), `invalid_grant` (device
+code già usato — il riuso revoca i token già emessi — o inesistente). Successo: `200` con `access_token`
+(JWT, 15 min), `id_token`, `refresh_token` (con `offline_access`), `scope`. Il device code è monouso.
+Client sconosciuto: `401 invalid_client`; client senza il grant: `400`.
+
+**Refresh**: come gli altri client (`grant_type=refresh_token`, rotazione a ogni uso, **90 giorni scorrevoli**,
+grace 30 s).
+
+**Pagina `/device`**: inserimento codice → conferma ("TV StreamingEngine", codice, **Conferma** / **Annulla**)
+→ se l'utente non ha sessione, login normale (`/ui/interaction/:uid`) e consenso → pagina di successo.
+Stessa CSP delle altre pagine (nessuno script inline). Anti brute force: **12 invii ogni 5 minuti per IP** su
+`POST /device` (`429` + `Retry-After`); il codice ha 20^8 combinazioni e vale 10 minuti.

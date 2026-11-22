@@ -35,17 +35,27 @@ export async function ensureDefaultClients(db: Db, config: Config): Promise<void
     await db.query(`
       INSERT INTO "${db.schema}"."clients" (
         client_id, client_name, client_type, token_endpoint_auth_method,
-        redirect_uris, post_logout_redirect_uris, scope, audience, backchannel_events_uri
-      ) VALUES ($1, $2, 'public', 'none', $3, $4, $5, $6, $7)
+        redirect_uris, post_logout_redirect_uris, scope, audience, backchannel_events_uri,
+        grant_types, response_types, application_type, cors_origins
+      ) VALUES ($1, $2, 'public', 'none', $3, $4, $5, $6, $7,
+        COALESCE($8::text[], '{authorization_code,refresh_token}'),
+        CASE WHEN $8::text[] IS NOT NULL AND NOT ('authorization_code' = ANY($8::text[])) THEN '{}'::text[] ELSE '{code}'::text[] END,
+        COALESCE($9::text, 'web'), COALESCE($10::text[], '{}'))
       ON CONFLICT (client_id) DO UPDATE SET
         client_name = EXCLUDED.client_name,
         redirect_uris = EXCLUDED.redirect_uris,
         post_logout_redirect_uris = EXCLUDED.post_logout_redirect_uris,
         scope = EXCLUDED.scope, audience = EXCLUDED.audience,
         backchannel_events_uri = EXCLUDED.backchannel_events_uri,
+        -- Metadati opzionali: se il .env non li dichiara, la riga esistente resta com'e'.
+        grant_types = CASE WHEN $8::text[] IS NULL THEN clients.grant_types ELSE EXCLUDED.grant_types END,
+        response_types = CASE WHEN $8::text[] IS NULL THEN clients.response_types ELSE EXCLUDED.response_types END,
+        application_type = COALESCE($9::text, clients.application_type),
+        cors_origins = COALESCE($10::text[], clients.cors_origins),
         updated_at = now()
       WHERE clients.client_type = 'public'
     `, [client.clientId, client.clientName ?? client.clientId, client.redirectUris,
-      client.postLogoutRedirectUris, client.scope, client.audience, client.backchannelEventsUri ?? null]);
+      client.postLogoutRedirectUris, client.scope, client.audience, client.backchannelEventsUri ?? null,
+      client.grantTypes ?? null, client.applicationType ?? null, client.corsOrigins ?? null]);
   }
 }

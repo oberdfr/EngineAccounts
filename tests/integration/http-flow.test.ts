@@ -286,15 +286,23 @@ describe('flusso completo su HTTP (registrazione -> refresh)', () => {
     expect(userinfo2.status, 'il nuovo access token vale').toBe(200);
     expect(((await userinfo2.json()) as Record<string, unknown>).sub).toBe(userSub);
 
-    // Il riuso del vecchio refresh token e' il caso che chiama la revoca di
-    // famiglia: lo qui verifichiamo solo che venga rifiutato, la famiglia e'
-    // coperta dalla suite di sicurezza.
+    // Il riuso del vecchio refresh token **entro 30 s** e' la grace window
+    // (due schede, retry di rete): risposta idempotente, stesso successore, e
+    // la famiglia resta viva. Oltre i 30 s la revoca di famiglia e' coperta
+    // dalla suite di sicurezza (`oidc-hardening.test.ts`).
     const replay = await client.postForm('/token', {
       grant_type: 'refresh_token',
       refresh_token: tokens.refresh_token!,
       client_id: TEST_CLIENT_ID,
     });
-    expect(replay.status, 'il riuso deve essere rifiutato').toBeGreaterThanOrEqual(400);
+    expect(replay.status, 'entro la grace il riuso e\' idempotente').toBe(200);
+    expect(((await replay.json()) as { refresh_token: string }).refresh_token).toBe(rotated.refresh_token);
+    const stillAlive = await client.postForm('/token', {
+      grant_type: 'refresh_token',
+      refresh_token: rotated.refresh_token,
+      client_id: TEST_CLIENT_ID,
+    });
+    expect(stillAlive.status, 'la famiglia non e\' stata revocata').toBe(200);
   }, 60_000);
 
   it('client confidenziale: stesso percorso HTTP con client_secret_basic', async () => {

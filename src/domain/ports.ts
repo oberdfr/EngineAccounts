@@ -41,7 +41,8 @@ export interface AccountsStore {
   createSession(input: Omit<SessionRecord, 'lastSeenAt' | 'revokedAt' | 'revokeReason'>): Promise<SessionRecord>;
   findSession(id: string): Promise<SessionRecord | undefined>;
   findSessionByTokenDigest(digest: string): Promise<SessionRecord | undefined>;
-  touchSession(id: string): Promise<void>;
+  /** Aggiorna `last_seen_at` e, se indicato, sposta avanti `expires_at` (mai indietro). */
+  touchSession(id: string, expiresAt?: Date): Promise<void>;
   linkProviderSession(id: string, providerSessionId: string, providerSessionUid: string | null): Promise<void>;
   listSessions(userId: string, includeInactive?: boolean): Promise<SessionRecord[]>;
   revokeSession(id: string, reason: string): Promise<SessionRecord | undefined>;
@@ -126,6 +127,29 @@ export interface OidcTokenStore {
   findByUid(kind: OidcModelKind, uid: string): Promise<OidcEntry | undefined>;
   findByUserCode(kind: OidcModelKind, userCode: string): Promise<OidcEntry | undefined>;
   consume(kind: OidcModelKind, id: string): Promise<void>;
+  /**
+   * Annota sul token consumato il jti del suo successore (`supersededBy` nel
+   * payload). Solo `tokens`, solo la prima volta: e' il dato su cui si regge la
+   * grace window della rotazione (`findSuperseded`).
+   */
+  setSuccessor(kind: OidcModelKind, id: string, successor: string): Promise<void>;
+  /**
+   * Un refresh token gia' consumato, con il suo successore (se emesso) e
+   * l'istante esatto del consumo: serve a rispondere in modo idempotente al
+   * riuso **entro la grace window**. `undefined` se l'id non esiste.
+   */
+  findSuperseded(id: string): Promise<
+    | {
+        payload: OidcEntry;
+        grantId: string | null;
+        consumedAt: Date | null;
+        consumedAtMs: number | null;
+        revokedAt: Date | null;
+        /** Il successore gia' registrato per questo token (`rotation.successor`). */
+        successorId: string | null;
+      }
+    | undefined
+  >;
   destroy(kind: OidcModelKind, id: string): Promise<void>;
   revokeByGrantId(grantId: string): Promise<number>;
   /** Evidenza di famiglia per i test e per il pannello account. */

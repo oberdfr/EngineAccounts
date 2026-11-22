@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { z } from 'zod';
+import { validateClientApplication } from './oidc/native-client.js';
 
 /**
  * Configurazione del servizio, validata una sola volta all'avvio.
@@ -48,8 +49,14 @@ const clientUri = z.string().url().refine((value) => {
 const publicClientSchema = z.object({
   clientId: z.string().min(1),
   clientName: z.string().min(1).optional(),
-  redirectUris: z.array(clientUri).min(1),
+  // Vuoto solo per i client device-only (vedi refine sotto).
+  redirectUris: z.array(clientUri).default([]),
   postLogoutRedirectUris: z.array(clientUri).default([]),
+  // Opzionali: default authorization_code + refresh_token, web. Un client TV
+  // dichiara il device grant, `applicationType: native` e le sue origini CORS.
+  grantTypes: z.array(z.enum(['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:device_code'])).min(1).optional(),
+  applicationType: z.enum(['web', 'native']).optional(),
+  corsOrigins: z.array(z.string().min(1)).max(8).optional(),
   scope: z.array(z.string().min(1)).default(['openid', 'profile', 'email', 'offline_access'])
     .refine((scopes) => scopes.includes('openid'), 'scope deve includere openid'),
   audience: z.string().url(),
@@ -59,7 +66,9 @@ const publicClientSchema = z.object({
   serviceDescription: z.string().max(2000).optional(),
   adminUrl: clientUri.optional(),
   adminApiUrl: clientUri.optional(),
-}).strict();
+}).strict().refine((client) => client.redirectUris.length > 0 ||
+  (client.grantTypes !== undefined && !client.grantTypes.includes('authorization_code')),
+'redirectUris obbligatorio salvo client device-only (grantTypes senza authorization_code)');
 
 const configuredClientsSchema = z.string().default('[]').transform((value, ctx) => {
   try { return JSON.parse(value) as unknown; }
@@ -131,6 +140,9 @@ const schema = z.object({
   // Registrazione dichiarativa di SPA pubbliche. Nessun dominio di un consumer
   // nel core; i client confidenziali restano amministrati tramite CLI.
   OIDC_CLIENTS_JSON: configuredClientsSchema,
+  // Device Authorization Grant (RFC 8628) per client TV. Spento di default:
+  // /device/auth e /device non esistono finche' non e' acceso.
+  OIDC_DEVICE_FLOW_ENABLED: booleanish.default(false),
   // TLS outside loopback, unless an operator explicitly trusts an HTTP origin.
   BACKCHANNEL_HTTP_ALLOWED_ORIGINS: z.string().default(''),
   // Segreto condiviso per firmare/verificare gli eventi back-channel (C11).
@@ -155,15 +167,23 @@ const schema = z.object({
   HSTS_MAX_AGE: int(31_536_000, 0),
   HSTS_INCLUDE_SUBDOMAINS: booleanish.default(false),
 
-  // --- scadenze (contratto: 15 min access, 30 giorni refresh) ---------------
+  /*
+   * --- scadenze ---------------------------------------------------------
+   * L'accesso deve essere **permanente salvo logout esplicito**: access e id
+   * token restano corti (15 minuti, cosi' una revoca ha effetto in fretta), ma
+   * la sessione IdP e il refresh token durano 90 giorni **scorrevoli**: ogni
+   * rinnovo riparte da capo. Il vincolo reale e' `min(refresh, sessione)`:
+   * allineare i due TTL evita il caso "il refresh token c'e' ma la sessione e'
+   * scaduta" che era la causa delle disconnessioni a ~14 giorni.
+   */
   ACCESS_TOKEN_TTL: int(900, 60),
-  REFRESH_TOKEN_TTL: int(2_592_000, 600),
+  REFRESH_TOKEN_TTL: int(7_776_000, 600, 315_360_000),
   ID_TOKEN_TTL: int(900, 60),
   PASSWORD_RESET_TTL: int(900, 60),
   EMAIL_VERIFICATION_TTL: int(900, 60),
   EMAIL_CHANGE_TTL: int(900, 60),
   MAGIC_CODE_TTL: int(300, 60),
-  SESSION_TTL: int(1_209_600, 300, 31_536_000),
+  SESSION_TTL: int(7_776_000, 300, 31_536_000),
   EMAIL_VERIFICATION_REQUIRED: booleanish.default(false),
   TOTP_REQUIRED: booleanish.default(false),
   ADMIN_MFA_REQUIRED: booleanish.default(true).refine((value) => value, 'MFA admin obbligatoria'),
@@ -299,6 +319,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   const raw = parsed.data;
   for (const client of raw.OIDC_CLIENTS_JSON) {
+    validateClientApplication({
+      applicationType: client.applicationType, corsOrigins: client.corsOrigins ?? [], clientType: 'public',
+      redirectUris: client.redirectUris, postLogoutRedirectUris: client.postLogoutRedirectUris,
+      grantTypes: client.grantTypes,
+    });
     if (client.backchannelEventsUri && !isAllowedBackchannelUri(client.backchannelEventsUri, raw.BACKCHANNEL_HTTP_ALLOWED_ORIGINS)) {
       throw new Error(`backchannelEventsUri non sicura per ${client.clientId}: HTTPS, loopback o origine HTTP interna autorizzata richiesti`);
     }

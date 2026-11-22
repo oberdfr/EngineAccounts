@@ -35,7 +35,9 @@ describe('client pubblici dichiarati in .env', () => {
     const calls = await capture();
     expect(calls).toHaveLength(4);
     expect(calls[3]!.values).toEqual([client.clientId, client.clientName, client.redirectUris,
-      client.postLogoutRedirectUris, client.scope, client.audience, client.backchannelEventsUri]);
+      client.postLogoutRedirectUris, client.scope, client.audience, client.backchannelEventsUri,
+      // grantTypes / applicationType / corsOrigins non dichiarati: la riga esistente non cambia.
+      null, null, null]);
     expect(calls[3]!.text).toContain('ON CONFLICT (client_id) DO UPDATE SET');
     expect(calls[3]!.text).toContain("WHERE clients.client_type = 'public'");
     expect(calls[3]!.text).not.toContain('streaming.oberdfr.top');

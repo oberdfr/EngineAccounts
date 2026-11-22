@@ -12,6 +12,42 @@ const native = (): ClientRecord => ({ clientId: 'native', clientName: 'Native', 
   audience: 'https://api.example', backchannelEventsUri: null, tokenEndpointAuthMethod: 'none', enabled: true,
   createdAt: new Date(), updatedAt: new Date() });
 
+describe('device-flow client policy', () => {
+  it('ammette il literal null solo per un client device-flow che lo dichiara', () => {
+    const device = { ...native(), redirectUris: [], corsOrigins: ['https://appassets.androidplatform.net', 'null'],
+      grantTypes: ['refresh_token', 'urn:ietf:params:oauth:grant-type:device_code'] };
+    expect(() => validateClientApplication(device)).not.toThrow();
+    expect(nativeCorsAllowed('null', device)).toBe(true);
+    expect(nativeCorsAllowed('https://appassets.androidplatform.net', device)).toBe(true);
+    expect(nativeCorsAllowed('https://evil.example', device)).toBe(false);
+    expect(() => validateClientApplication({ ...native(), corsOrigins: ['null'] })).toThrow();
+    expect(nativeCorsAllowed('null', native())).toBe(false);
+    expect(redirectOriginsOf([{ ...device, enabled: true }])).toEqual([]);
+  });
+
+  it('ammette file:// (webOS 6) solo per un client device-flow che lo dichiara', () => {
+    const device = { ...native(), redirectUris: [], corsOrigins: ['null', 'file://'],
+      grantTypes: ['refresh_token', 'urn:ietf:params:oauth:grant-type:device_code'] };
+    expect(() => validateClientApplication(device)).not.toThrow();
+    expect(nativeCorsAllowed('file://', device)).toBe(true);
+    expect(nativeCorsAllowed('file://', { ...device, corsOrigins: ['null'] })).toBe(false);
+    expect(() => validateClientApplication({ ...native(), corsOrigins: ['file://'] })).toThrow();
+    expect(nativeCorsAllowed('file://', native())).toBe(false);
+    expect(redirectOriginsOf([{ ...device, enabled: true }])).toEqual([]);
+  });
+
+  it('ammette l\'origine reale di webOS 6 (file://<appId>-webos) solo se dichiarata', () => {
+    const real = 'file://top.oberdfr.streamingengine.tv-webos';
+    const device = { ...native(), redirectUris: [], corsOrigins: ['null', 'file://', real],
+      grantTypes: ['refresh_token', 'urn:ietf:params:oauth:grant-type:device_code'] };
+    expect(() => validateClientApplication(device)).not.toThrow();
+    expect(nativeCorsAllowed(real, device)).toBe(true);
+    expect(nativeCorsAllowed('file://other.app-webos', device)).toBe(false);
+    expect(() => validateClientApplication({ ...device, corsOrigins: ['file://x/path'] })).toThrow();
+    expect(() => validateClientApplication({ ...native(), corsOrigins: [real] })).toThrow();
+  });
+});
+
 describe('explicit native client policy', () => {
   it('publishes native metadata and a dedicated CORS allowlist', () => {
     expect(toClientMetadata(native(), {} as Config)).toMatchObject({

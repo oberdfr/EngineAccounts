@@ -451,29 +451,38 @@ describe('rotazione e rilevamento del riuso del refresh token', () => {
     expect(rotatedAgain.refresh_token).not.toBe(rotated.refresh_token);
   }, 60_000);
 
-  it('rifiuta il riuso di un refresh token gia\' usato', async () => {
-    const { client, refreshToken } = await issueTokenPair('st-reuse');
+  it('entro la grace window il riuso e\' idempotente (schede sorelle, retry di rete)', async () => {
+    const { client, refreshToken } = await issueTokenPair('st-grace');
     const first = await client.postForm('/token', {
       grant_type: 'refresh_token',
       refresh_token: refreshToken,
       client_id: TEST_CLIENT_ID,
     });
     expect(first.status).toBe(200);
-    const { refresh_token: rotated } = (await first.json()) as { refresh_token: string };
+    const rotated = (await first.json()) as { refresh_token: string; access_token: string };
 
-    // Il token **gia' consumato**: deve fallire. E' il rilevamento del riuso.
+    // Riuso immediato (entro 30 s): **stesso** refresh token, nessuna revoca.
+    // E' il caso di due schede sullo stesso RT o di un retry dopo un timeout.
     const replay = await client.postForm('/token', {
       grant_type: 'refresh_token',
       refresh_token: refreshToken,
       client_id: TEST_CLIENT_ID,
     });
-    expect(replay.status, 'il riuso di un refresh token deve essere rifiutato').toBeGreaterThanOrEqual(400);
-    const body = (await replay.json()) as { error?: string };
-    expect(['invalid_grant', 'invalid_request']).toContain(body.error);
-    void rotated;
+    expect(replay.status, 'entro la grace il riuso non deve fallire').toBe(200);
+    const replayBody = (await replay.json()) as { refresh_token: string; access_token: string };
+    expect(replayBody.refresh_token).toBe(rotated.refresh_token);
+    expect(replayBody.access_token).toBeTruthy();
+
+    // La famiglia e' viva: il successore funziona ancora.
+    const next = await client.postForm('/token', {
+      grant_type: 'refresh_token',
+      refresh_token: rotated.refresh_token,
+      client_id: TEST_CLIENT_ID,
+    });
+    expect(next.status).toBe(200);
   }, 60_000);
 
-  it('il riuso revoca l\'intera famiglia: anche il token nuovo muore', async () => {
+  it('oltre la grace window il riuso revoca l\'intera famiglia', async () => {
     const { client, refreshToken } = await issueTokenPair('st-family');
     const first = await client.postForm('/token', {
       grant_type: 'refresh_token',
@@ -483,7 +492,22 @@ describe('rotazione e rilevamento del riuso del refresh token', () => {
     expect(first.status).toBe(200);
     const { refresh_token: rotated } = (await first.json()) as { refresh_token: string };
 
-    // Riuso del vecchio: scatena la revoca della famiglia.
+    // Sposto indietro **l'istante di consumo** di 31 secondi sul token vero
+    // (l'orologio del processo non si puo' aspettare in un test HTTP): da quel
+    // momento il riuso e' fuori dalla grace.
+    const rows = await h.db.query<{ id: string }>(
+      `SELECT id FROM "${h.config.DB_SCHEMA}"."oidc_tokens" WHERE payload->>'jti' = $1 AND kind = 'RefreshToken'`,
+      [refreshToken],
+    );
+    expect(rows.length).toBe(1);
+    await h.db.query(
+      `UPDATE "${h.config.DB_SCHEMA}"."oidc_tokens"
+       SET rotation = jsonb_set(rotation, '{consumedAtMs}', to_jsonb((extract(epoch from now()) * 1000)::bigint - 31000))
+       WHERE id = $1`,
+      [rows[0]!.id],
+    );
+
+    // Riuso del vecchio oltre la grace: scatena la revoca della famiglia.
     const replay = await client.postForm('/token', {
       grant_type: 'refresh_token',
       refresh_token: refreshToken,
@@ -492,7 +516,7 @@ describe('rotazione e rilevamento del riuso del refresh token', () => {
     expect(replay.status).toBeGreaterThanOrEqual(400);
 
     // Il token ruotato, fino a un momento prima valido, deve ora fallire:
-    // e' questo il punto dell'intera famiglia (contratto §6).
+    // e' questo il punto dell'intera famiglia.
     const afterRevoke = await client.postForm('/token', {
       grant_type: 'refresh_token',
       refresh_token: rotated,

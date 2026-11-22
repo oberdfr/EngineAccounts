@@ -1,6 +1,29 @@
 import type { ClientRecord } from '../domain/types.js';
 
-type Policy = Pick<ClientRecord, 'applicationType' | 'corsOrigins' | 'clientType' | 'redirectUris' | 'postLogoutRedirectUris'>;
+type Policy = Pick<ClientRecord, 'applicationType' | 'corsOrigins' | 'clientType' | 'redirectUris' | 'postLogoutRedirectUris'> &
+  Partial<Pick<ClientRecord, 'grantTypes'>>;
+
+export const DEVICE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code';
+
+/**
+ * Origini opache delle app TV impacchettate servite da file://. LG webOS 6
+ * (Chromium 79) invia `Origin: file://<appId>-webos` (verificato su TV
+ * reale); altre versioni `file://` o `null`. Ammesse solo per client
+ * device-flow che le dichiarano esattamente.
+ */
+function isOpaqueTvOrigin(origin: string): boolean {
+  return origin === 'null' || /^file:\/\/[a-z0-9.-]*$/i.test(origin);
+}
+
+/** Un client che usa il Device Authorization Grant (RFC 8628), tipicamente una TV. */
+export function isDeviceClient(client: { grantTypes?: readonly string[] }): boolean {
+  return (client.grantTypes ?? []).includes(DEVICE_GRANT);
+}
+
+/** Device-only: nessun redirect, quindi nessuna navigazione verso l'app. */
+function isDeviceOnly(client: { grantTypes?: readonly string[] }): boolean {
+  return isDeviceClient(client) && !(client.grantTypes ?? []).includes('authorization_code');
+}
 
 /** Explicit native metadata, never inferred from a client name or redirect. */
 export function validateClientApplication(client: Policy): void {
@@ -11,10 +34,12 @@ export function validateClientApplication(client: Policy): void {
     return;
   }
   if (client.clientType !== 'public') throw new Error('Native clients must be public and use PKCE.');
-  if (!client.redirectUris.length || !client.corsOrigins?.length || client.corsOrigins.length > 8) {
+  if ((!client.redirectUris.length && !isDeviceOnly(client)) || !client.corsOrigins?.length || client.corsOrigins.length > 8) {
     throw new Error('Native clients require redirects and a bounded explicit CORS allowlist.');
   }
   for (const origin of client.corsOrigins) {
+    // Il literal `null` (webOS file://) e' ammesso solo per i client device-flow, esplicitamente.
+    if (isOpaqueTvOrigin(origin) && isDeviceClient(client)) continue;
     const url = new URL(origin);
     if (url.protocol !== 'https:' || url.origin !== origin || url.username || url.password || origin.includes('*')) {
       throw new Error('Native CORS origins must be exact HTTPS origins, not paths, wildcards or null.');
@@ -33,8 +58,11 @@ export function validateClientApplication(client: Policy): void {
   }
 }
 
-export function nativeCorsAllowed(origin: string, client: { applicationType?: string; corsOrigins?: readonly string[] }): boolean {
-  if (origin === 'null' || origin === '*') return false;
+export function nativeCorsAllowed(origin: string, client: { applicationType?: string; corsOrigins?: readonly string[]; grantTypes?: readonly string[] }): boolean {
+  if (isOpaqueTvOrigin(origin)) {
+    return client.applicationType === 'native' && isDeviceClient(client) && (client.corsOrigins ?? []).includes(origin);
+  }
+  if (origin === '*') return false;
   return client.applicationType === 'native' && (client.corsOrigins ?? []).some((allowed) => {
     try { return !allowed.includes('*') && new URL(allowed).protocol === 'https:' && new URL(allowed).origin === allowed && allowed === origin; }
     catch { return false; }

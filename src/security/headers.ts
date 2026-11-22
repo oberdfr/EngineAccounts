@@ -33,6 +33,24 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
  * **allowlist delle origini dei client registrati**: sono gia' dati in tabella,
  * sono gli unici destinatari che il contratto autorizza, e non richiedono che
  * nessuno se li inventi a mano. Nessun dominio estraneo, nessun `*`.
+ *
+ * **`frame-ancestors` ha una sola eccezione, e vale solo per il flusso
+ * silenzioso** (`prompt=none` su `authorizationEndpoint`). Il rinnovo senza
+ * interazione dell'utente passa dal browser come iframe del client: se il
+ * provider risponde `frame-ancestors 'none'` l'iframe non carica mai e il
+ * rinnovo fallisce *sempre*. L'eccezione e' ristretta al massimo:
+ *   - si applica **solo** a `GET authorizationEndpoint`, e solo quando la
+ *     richiesta porta `prompt=none` (e nessun `response_type` che il contratto
+ *     non usi): sono le sole risposte che possono essere un redirect al
+ *     `redirect_uri` di un client registrato;
+ *   - le origini ammesse sono le **stesse** dei `redirect_uri` registrati
+ *     (`redirectOriginsOf`), non un parametro del richiedente: un client non
+ *     puo' chiedere di essere incorniciato da un'origine che non possiede;
+ *   - su quella risposta `X-Frame-Options` **non** viene emesso (non sa
+ *     esprimere un elenco e `DENY`/`SAMEORIGIN` annullerebbero la CSP).
+ * Pagine di login, consenso e account restano `frame-ancestors 'none'` +
+ * `X-Frame-Options: DENY`: il clickjacking su una pagina interattiva resta
+ * impossibile.
  */
 
 /** Origine (`scheme://host[:port]`) di una URL, oppure `null` se non e' URL. */
@@ -58,7 +76,9 @@ export function redirectOriginsOf(clients: readonly { redirectUris: readonly str
   const origins = new Set<string>();
   for (const client of clients) {
     if (!client.enabled) continue;
-    if (client.applicationType === 'native') {
+    // Un client device-only (TV, nessun redirect) non naviga mai verso l'app:
+    // le sue origini CORS non entrano in form-action / frame-ancestors.
+    if (client.applicationType === 'native' && client.redirectUris.length) {
       for (const origin of client.corsOrigins ?? []) {
         try { if (!origin.includes('*') && new URL(origin).protocol === 'https:' && new URL(origin).origin === origin) origins.add(origin); }
         catch { /* Invalid native origins never widen the allowlist. */ }
@@ -106,9 +126,10 @@ export function formActionSources(extraOrigins: readonly string[] = []): string[
  * Costruisce la CSP. `formActionOrigins` finisce in `form-action` e va passato
  * **solo** sulle pagine che possono davvero finire fuori origine (le pagine di
  * interazione); altrove resta `'self'`, per non allargare la politica di pagine
- * che non ne hanno bisogno.
+ * che non ne hanno bisogno. `frameAncestors` vale `'none'` ovunque tranne la
+ * risposta silenziosa `/auth?prompt=none`: dettaglio in cima al file.
  */
-export function buildCsp(formActionOrigins: readonly string[] = []): string {
+export function buildCsp(formActionOrigins: readonly string[] = [], frameAncestors: readonly string[] | 'none' = 'none'): string {
   return [
     "default-src 'none'",
     "script-src 'self'",
@@ -117,11 +138,44 @@ export function buildCsp(formActionOrigins: readonly string[] = []): string {
     "font-src 'self'",
     "connect-src 'self'",
     `form-action ${formActionSources(formActionOrigins).join(' ')}`,
-    "frame-ancestors 'none'",
+    `frame-ancestors ${frameAncestorsSources(frameAncestors).join(' ')}`,
     "base-uri 'none'",
     "object-src 'none'",
     "manifest-src 'self'",
   ].join('; ');
+}
+
+/**
+ * Valori di `frame-ancestors`. Accetta solo origini assolute `http(s)` e il
+ * letterale `'none'`: qualunque altra stringa (incluso `*`, `http:`, un percorso)
+ * viene scartata, e **se resta vuoto si torna a `'none'`**. Fail closed: un
+ * elenco malformato non deve poter aprire l'embedding a tutti.
+ */
+export function frameAncestorsSources(frameAncestors: readonly string[] | 'none'): string[] {
+  if (frameAncestors === 'none') return ["'none'"];
+  const sources = new Set<string>();
+  for (const raw of frameAncestors) {
+    const origin = originOf(String(raw ?? '').trim());
+    if (origin && origin === String(raw ?? '').trim()) sources.add(origin);
+  }
+  return sources.size ? [...sources].sort() : ["'none'"];
+}
+
+/**
+ * La richiesta e' una **authorization request silenziosa**: `prompt=none`
+ * (eventualmente fra altri valori separati da spazio) su `GET` del path di
+ * autorizzazione configurato (`/auth`). E' l'unico caso in cui il provider puo'
+ * rispondere con un redirect al `redirect_uri` senza che l'utente veda alcuna
+ * pagina nostra — ed e' quindi l'unico caso che un client puo' incorniciare.
+ */
+export function isSilentAuthorizationRequest(method: string, rawUrl: string | undefined, authorizationEndpoint = '/auth'): boolean {
+  if (method !== 'GET' && method !== 'HEAD') return false;
+  const raw = rawUrl ?? '';
+  const queryAt = raw.indexOf('?');
+  const path = queryAt === -1 ? raw : raw.slice(0, queryAt);
+  if (path !== authorizationEndpoint) return false;
+  if (queryAt === -1) return false;
+  return new URLSearchParams(raw.slice(queryAt + 1)).get('prompt')?.split(/\s+/).includes('none') === true;
 }
 
 /** CSP di base: `form-action 'self'`, per tutto cio' che non e' un flusso di autorizzazione. */
@@ -159,6 +213,13 @@ export interface SecurityHeaderOptions {
    * le pagine del flusso di autorizzazione: vedere la nota in cima al file.
    */
   formActionOrigins?: readonly string[];
+  /**
+   * `frame-ancestors`. Default `'none'`; le origini dei client registrati (o
+   * `'none'`) vanno passate **solo** sulla risposta silenziosa `GET /auth?prompt=none`.
+   * Con un elenco il messaggio `X-Frame-Options` non viene emesso: un browser
+   * che capisce `DENY`/`SAMEORIGIN` annullerebbe la direttiva.
+   */
+  frameAncestors?: readonly string[] | 'none';
 }
 
 /**
@@ -186,15 +247,26 @@ export function flushReplyHeadersToRaw(reply: FastifyReply): void {
 
 export function applySecurityHeaders(request: FastifyRequest, reply: FastifyReply, options: SecurityHeaderOptions = {}): void {
   const { isPage = false } = options;
-  reply.header('Content-Security-Policy', buildCsp(options.formActionOrigins ?? []));
+  const frameAncestors = frameAncestorsSources(options.frameAncestors ?? 'none');
+  reply.header('Content-Security-Policy', buildCsp(options.formActionOrigins ?? [], options.frameAncestors ?? 'none'));
   reply.header('X-Content-Type-Options', 'nosniff');
-  reply.header('X-Frame-Options', 'DENY');
+  // `X-Frame-Options` non sa esprimere un elenco: quando c'e' un elenco di
+  // origini ammesse (solo la risposta silenziosa) si omette, altrimenti un
+  // browser legacy annullerebbe `frame-ancestors`. Ovunque altro resta `DENY`.
+  if (frameAncestors.length === 1 && frameAncestors[0] === "'none'") reply.header('X-Frame-Options', 'DENY');
   // `no-referrer`: nessuna URL della UI (con `state`, `code`, `nonce`) deve
   // arrivare a un terzo, nemmeno per referrer.
   reply.header('Referrer-Policy', 'no-referrer');
   reply.header('Permissions-Policy', PERMISSIONS_POLICY);
   reply.header('Cross-Origin-Opener-Policy', 'same-origin');
-  reply.header('Cross-Origin-Resource-Policy', 'same-origin');
+  // Le app TV impacchettate (webOS 6: `Origin: file://<appId>-webos`, altre
+  // versioni `file://` o `null`) chiamano /device/auth e /token: Chromium 79
+  // (LG webOS 6) applica CORP anche a quelle risposte e con `same-origin` le
+  // blocca (ERR_BLOCKED_BY_RESPONSE). L'accesso resta deciso dal CORS,
+  // concesso solo al client device-flow che dichiara queste origini.
+  const origin = request.headers.origin;
+  const opaqueTv = typeof origin === 'string' && (origin === 'null' || origin.indexOf('file://') === 0);
+  reply.header('Cross-Origin-Resource-Policy', opaqueTv ? 'cross-origin' : 'same-origin');
   reply.removeHeader('X-Powered-By');
   const hsts = options.hsts ? hstsHeader(request, options.hsts) : null;
   if (hsts) reply.header('Strict-Transport-Security', hsts);

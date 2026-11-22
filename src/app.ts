@@ -10,7 +10,7 @@ import { Provider } from 'oidc-provider';
 import type { Config } from './config.js';
 import type { Db } from './db/pool.js';
 import { createAccountsStore, createOidcTokenStore } from './db/repositories.js';
-import { applySecurityHeaders, flushReplyHeadersToRaw, redirectOriginsOf, redirectFormActionsOf } from './security/headers.js';
+import { applySecurityHeaders, flushReplyHeadersToRaw, isSilentAuthorizationRequest, redirectOriginsOf, redirectFormActionsOf } from './security/headers.js';
 import { csrfCookieName, isCsrfProtected, CSRF_FIELD } from './security/csrf.js';
 import { activePublicJwks, buildProvider } from './oidc/provider.js';
 import { registerUserinfoRoute } from './oidc/userinfo.js';
@@ -237,14 +237,25 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
    */
   const clientOrigins = async (): Promise<string[]> => redirectOriginsOf(await store.listClients());
 
-  // Header di sicurezza su tutto, CSP inclusa.
+  /*
+   * La sola eccezione a `frame-ancestors 'none'`: `GET /auth?prompt=none`.
+   * Le origini sono quelle dei `redirect_uri` registrati (mai un parametro
+   * della richiesta) e la decisione si prende **prima** che il provider parta,
+   * cosi' l'header e' gia' impostato quando la libreria scrive la risposta (il
+   * middleware OIDC fa `flushReplyHeadersToRaw`). Se non c'e' nessun'origine
+   * registrata l'elenco e' vuoto e `frameAncestorsSources` torna a `'none'`.
+   * Dettaglio e razionale in `security/headers.ts`.
+   */
   app.addHook('onRequest', async (request, reply) => {
     const path = (request.raw.url ?? '/').split('?')[0] ?? '/';
     const isPage = request.method === 'GET' && (path.startsWith('/ui/') || path.startsWith('/account') || path.startsWith('/admin') || path === '/');
+    const silentAuthorization =
+      path === '/auth' && isSilentAuthorizationRequest(request.method, request.raw.url ?? undefined);
     applySecurityHeaders(request, reply, {
       isPage,
       hsts: config.hsts,
       formActionOrigins: path.startsWith('/ui/interaction/') ? redirectFormActionsOf(await store.listClients()) : [],
+      frameAncestors: silentAuthorization ? await clientOrigins() : 'none',
     });
     if (request.method !== 'GET' && request.method !== 'HEAD' && !isOIDCPath(path)) {
       reply.header('Cache-Control', 'no-store');
@@ -285,7 +296,7 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
 
   const provider =
     options.provider ??
-    (await buildProvider({ config, db, store, tokens, argon: argonFromConfig(config), authorization }));
+    (await buildProvider({ config, db, store, tokens, argon: argonFromConfig(config), authorization, limiter }));
 
   /*
    * Montaggio del provider.

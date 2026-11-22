@@ -324,6 +324,50 @@ describe('header di sicurezza sulle risposte', () => {
       expect(res.headers.get('strict-transport-security'), `${path} con HSTS su http`).toBeNull();
     }
   });
+
+  it('la sola eccezione: GET /auth con prompt=none puo\' essere incorniciata dalle origini dei client', async () => {
+    const client = new HttpClient(h.baseUrl);
+    const pair = pkce('S256');
+    const silent = await client.get(
+      `/auth?response_type=code&client_id=${encodeURIComponent(TEST_CLIENT_ID)}` +
+        `&redirect_uri=${encodeURIComponent(TEST_REDIRECT_URI)}&scope=openid&state=st-silent` +
+        `&nonce=n-silent&prompt=none&code_challenge=${encodeURIComponent(pair.challenge)}` +
+        `&code_challenge_method=S256`,
+    );
+    const csp = silent.headers.get('content-security-policy') ?? '';
+    // L'iframe cross-site serve al silent renew: l'origine del client e' ammessa.
+    expect(csp).toContain(`frame-ancestors ${new URL(TEST_REDIRECT_URI).origin}`);
+    expect(csp).not.toContain("frame-ancestors 'none'");
+    // `X-Frame-Options` non sa esprimere un elenco: non deve esserci, o
+    // annullerebbe la direttiva nei browser che la capiscono.
+    expect(silent.headers.get('x-frame-options')).toBeNull();
+    // Il resto della politica non si e' allargato.
+    expect(csp).toContain("default-src 'none'");
+    expect(csp).toContain("script-src 'self'");
+    expect(csp).not.toContain('unsafe-inline');
+  });
+
+  it('senza prompt=none /auth resta DENY', async () => {
+    const client = new HttpClient(h.baseUrl);
+    const pair = pkce('S256');
+    const interactive = await client.get(
+      `/auth?response_type=code&client_id=${encodeURIComponent(TEST_CLIENT_ID)}` +
+        `&redirect_uri=${encodeURIComponent(TEST_REDIRECT_URI)}&scope=openid&state=st-interactive` +
+        `&nonce=n-interactive&code_challenge=${encodeURIComponent(pair.challenge)}&code_challenge_method=S256`,
+    );
+    const csp = interactive.headers.get('content-security-policy') ?? '';
+    expect(csp).toContain("frame-ancestors 'none'");
+    expect(interactive.headers.get('x-frame-options')).toBe('DENY');
+  });
+
+  it('le pagine di login, consenso e account restano DENY anche in un iframe', async () => {
+    const client = new HttpClient(h.baseUrl);
+    for (const path of ['/ui/login', '/ui/register', '/account', '/ui/interaction/inesistente']) {
+      const res = await client.get(path);
+      expect(res.headers.get('content-security-policy') ?? '', path).toContain("frame-ancestors 'none'");
+      expect(res.headers.get('x-frame-options'), path).toBe('DENY');
+    }
+  });
 });
 
 describe('CORS', () => {
